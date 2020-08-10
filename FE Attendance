@@ -1,0 +1,241 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import date
+import datetime
+import boto3
+
+
+# In[2]:
+
+
+import boto3, csv, time, sys, os, psycopg2,pandas as pd, mysql.connector, re, numpy as np
+
+
+# In[3]:
+
+
+s3 = boto3.resource('s3')
+
+
+# In[4]:
+
+
+from datetime import date, datetime, timedelta
+
+
+# In[5]:
+
+
+from datetime import date
+
+
+# In[6]:
+
+
+def run_query(client, query, database, s3_output):
+    response = client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={
+            'Database': database
+        },
+        ResultConfiguration={
+            'OutputLocation': s3_output,
+        }
+    )
+    # print('Execution ID: ' + response['QueryExecutionId'])
+    return response
+
+
+# In[7]:
+
+
+def get_query_status(client, Execution_Id):
+    response = client.get_query_execution(
+        QueryExecutionId=Execution_Id
+    )
+    query_id = response['QueryExecution']['QueryExecutionId']
+    status = response['QueryExecution']['Status']['State']
+    print('Started')
+    print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    while status not in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+        # print('|' + status, end='')
+        time.sleep(30)
+        response = client.get_query_execution(
+            QueryExecutionId=Execution_Id
+        )
+        status = response['QueryExecution']['Status']['State']
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    if status in ['SUCCEEDED']:
+        return True
+    if status in ['FAILED', 'CANCELLED']:
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+        print("Failure Reason: {}".format(
+            response['QueryExecution']['Status'].get('StateChangeReason', 'Error Unknown')))
+        return False
+    else:
+        return False
+
+
+# In[8]:
+
+
+def run_query_to_athena(query, output_filename):
+    client = boto3.client('athena', 'us-east-1' )
+    s3_output = "s3://aws-athena-query-results-190020191201-us-east-1/"
+    s3_bucket="aws-athena-query-results-190020191201-us-east-1"
+    database = 'express_dwh'
+    res = run_query(client, query, database, s3_output)
+
+    q_id = res['QueryExecutionId']
+    if get_query_status(client, q_id):
+        print("Query Successful. Downloading data: ")
+        os.system("aws s3 cp " + s3_output + q_id + ".csv  {}".format(output_filename))
+        s3_key = q_id + '.csv'
+        local_filename = output_filename + '.csv'
+        s3.Bucket(s3_bucket).download_file(s3_key, local_filename)
+
+        return True
+    else:
+        print("Query Unsuccessful. Please check the query or the Athena server status")
+        return False
+
+
+# In[18]:
+
+
+daily_fe_attendance = """
+
+select eid,shift_date,employee_type,P,L,H,OH,WO,CASE WHEN "P" = 1 THEN 0 WHEN "L" = 1 THEN 0 WHEN "H" = 1 THEN 0 WHEN "OH" = 1 THEN 0 WHEN "WO" = 1 THEN 0 ELSE 1 END "A",CASE WHEN "P" IS NULL THEN 1 ELSE 0 END "NA"
+from
+(
+select eid,shift_date,CASE WHEN att_status = 1 THEN 1
+                     WHEN att_status IS NULL THEN NULL
+                     ELSE 0 END "P",
+                CASE WHEN in_leave = 1 THEN 1 
+                     ELSE 0 END "L",
+                CASE WHEN is_holiday = 1 THEN 1 
+                     ELSE 0 END "H",
+                CASE WHEN is_optional_holiday = 1 THEN 1
+                     ELSE 0 END "OH",
+                CASE WHEN att_status = 1 THEN 0 
+                     WHEN att_status = 0 and is_weekly_off = 1 THEN 1
+                     ELSE 0 END "WO",ad,CASE WHEN eid LIKE '%SSN%' THEN 'on-roll' ELSE 'off-roll' END employee_type ,row_number() over (partition by eid order  by ad asc) rnum
+from
+attendance_ad_json
+where
+shift_date = date_format ((current_timestamp - interval '2' day), '%d-%m-%Y')
+)
+where rnum =1
+
+
+
+
+
+
+
+"""
+
+
+# In[19]:
+
+
+dump_path = "daily_fe_attendance"
+result=run_query_to_athena(daily_fe_attendance, dump_path)
+
+
+# In[20]:
+
+
+local_filename= dump_path + '.csv'
+output_daily_fe_attendance =pd.read_csv(local_filename)
+
+
+# In[23]:
+
+
+off_roll_fe_attendance_data =output_daily_fe_attendance.loc[output_daily_fe_attendance['employee_type'] =='off-roll']
+
+
+# In[25]:
+
+
+off_roll_fe_attendance_data
+
+
+# In[24]:
+
+
+from sqlalchemy import create_engine
+engine = create_engine('mysql+mysqlconnector://{0}:{1}@{2}/{3}'.
+                                               format("root", "Delhivery@123", 
+                                                      "lmoa.delhivery.com", "lastmile"))
+
+
+# In[26]:
+
+
+off_roll_fe_attendance_data.to_sql('off_roll_fe_attendance_data', con=engine, if_exists='append', index=False, chunksize =10000)
+
+
+# In[27]:
+
+
+print(str(len(off_roll_fe_attendance_data.index)) + " row(s) added")
+
+
+# In[28]:
+
+
+engine.dispose()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
