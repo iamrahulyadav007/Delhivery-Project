@@ -1,0 +1,608 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import boto3, csv, time, sys, os, psycopg2,pandas as pd, mysql.connector, re, numpy as np
+
+
+# In[2]:
+
+
+s3 = boto3.resource('s3')
+
+
+# In[3]:
+
+
+from datetime import datetime
+
+
+# In[4]:
+
+
+from datetime import date
+
+
+# In[5]:
+
+
+def run_query(client, query, database, s3_output):
+    response = client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={
+            'Database': database
+        },
+        ResultConfiguration={
+            'OutputLocation': s3_output,
+        }
+    )
+    # print('Execution ID: ' + response['QueryExecutionId'])
+    return response
+
+
+# In[6]:
+
+
+def get_query_status(client, Execution_Id):
+    response = client.get_query_execution(
+        QueryExecutionId=Execution_Id
+    )
+    query_id = response['QueryExecution']['QueryExecutionId']
+    status = response['QueryExecution']['Status']['State']
+    print('Started')
+    print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    while status not in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+        # print('|' + status, end='')
+        time.sleep(30)
+        response = client.get_query_execution(
+            QueryExecutionId=Execution_Id
+        )
+        status = response['QueryExecution']['Status']['State']
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    if status in ['SUCCEEDED']:
+        return True
+    if status in ['FAILED', 'CANCELLED']:
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+        print("Failure Reason: {}".format(
+            response['QueryExecution']['Status'].get('StateChangeReason', 'Error Unknown')))
+        return False
+    else:
+        return False
+
+
+# In[7]:
+
+
+def run_query_to_athena(query, output_filename):
+    client = boto3.client('athena', 'us-east-1' )
+    s3_output = "s3://aws-athena-query-results-190020191201-us-east-1/"
+    s3_bucket="aws-athena-query-results-190020191201-us-east-1"
+    database = 'express_dwh'
+    res = run_query(client, query, database, s3_output)
+
+    q_id = res['QueryExecutionId']
+    if get_query_status(client, q_id):
+        print("Query Successful. Downloading data: ")
+        os.system("aws s3 cp " + s3_output + q_id + ".csv  {}".format(output_filename))
+        s3_key = q_id + '.csv'
+        local_filename = output_filename + '.csv'
+        s3.Bucket(s3_bucket).download_file(s3_key, local_filename)
+
+        return True
+    else:
+        print("Query Unsuccessful. Please check the query or the Athena server status")
+        return False
+
+
+# In[8]:
+
+try:
+    query_pda30='''
+    WITH cn_list
+    as
+    (
+    select id, cn, cn_type, region
+    from
+    (
+    select "property_facility_facility_code" as id , "property_facility_name" as cn,"property_facility_facility_type" as cn_type, property_city as city,property_zone as region,  row_number() over (partition by "property_facility_facility_code"  order by "action_date" desc) as row
+    from express_dwh.facility_ad_json
+
+
+    )
+    where row=1
+    and upper(cn_type) in ('DC', 'DC,PC')
+    and not upper(cn) like '%DPP%' 
+    and not upper(cn) like '%3PL%' 
+    and  upper(id) like 'IN%'
+    and not upper(cn) like 'TEST%'
+    )
+    , del_wbns as 
+    (select distinct wbn from "express_dwh_3m"."package_s3_parquet_3m"
+    where ad >= date_format(date_trunc('hour',current_timestamp - interval '92' DAY) - interval '00' MINUTE, '%Y-%m-%d-%H')
+    and
+    cs_st in ('DL','LT'))
+
+
+    SELECT wbn,cl,rs,pt,cs_sl,pdt,cs_nsl,
+    case when cs_nsl in 
+    (
+    'RD-PD18',
+    'EOD-14',
+    'EOD-3',
+    'DLYDG-119',
+    'RD-PD22',
+    'RD-PD20',
+    'RD-PD8',
+    'DLYDC-416',
+    'RD-PD15',
+    'RD-PD12',
+    'EOD-105',
+    'RD-PD21',
+    'RD-PD4',
+    'EOD-103',
+    'EOD-26',
+    'X-PDASS',
+    'ST-102',
+    'EOD-69',
+    'EOD-121',
+    'EOD-40',
+    'DTUP-222',
+    'EOD-111',
+    'DLYRPC-417',
+    'EOD-146',
+    'EOD-137',
+    'SC-103',
+    'L-FIN',
+    'DLYLH-144',
+    'DLYB2B-105',
+    'DLYLH-146',
+    'EOD-138',
+    'RD-PD3',
+    'EOD-133'
+    ) then 
+    '2.CS'
+    WHEN
+    cs_nsl in
+    (
+    'DTUP-213',
+    'X-DLL2F',
+    'DTUP-208',
+    'DTUP-209',
+    'X-DRO2R',
+    'DTUP-223',
+    'RD-PD17',
+    'U-PMA',
+    'X-IBL1F',
+    'DLYRG-125',
+    'DLYRG-130',
+    'X-UNEX',
+    'ST-110',
+    'X-APL-PL',
+    'X-DWS',
+    'L-PMA',
+    'DLYMR-119',
+    'X-DBD4R',
+    'X-DDD1FP',
+    'DOFF-128',
+    'RT-113',
+    'U-IAD',
+    'EOD-50',
+    'X-DBL1R',
+    'RT-109',
+    'EOD-44',
+    'X-IBL1R',
+
+    'DLYDC-110',
+    'DLYLH-126',
+    'X-OLL2F',
+    'X-BPT-AB',
+    'ST-118',
+    'S-XIN',
+    'X-DBFR',
+    'X-DBD3F',
+    'ST-114',
+    'DLYRG-132',
+    'X-PIOM',
+    'X-DBO1R',
+    'X-BMP',
+    'DLYSOR-100',
+    'RD-MP1',
+    'DTUP-204',
+    'DLYMR-122',
+    'DLYMR-118',
+    'RT-108',
+    'DLYLH-132',
+
+    'DLYLH-138',
+    'DLYDC-109',
+    'DLYB2B-103',
+    'X-IBO3R',
+    'DLYB2B-101',
+    'X-DDO3F',
+    'EOD-77',
+
+    'DTUP-207',
+    'DLYMPS-101',
+    'DLYDC-107',
+    'X-DBD1R',
+    'DLYDC-132',
+    'CB-101',
+    'DTUP-205',
+    'CL-106',
+    'X-IBD3R',
+    'EOD-6',
+    'ST-101',
+    'DTUP-218',
+
+    'DLYLH-145',
+    'L-PXM',
+    'ESC-100',
+    'ST-107',
+    'DLYLH-104',
+    'X-NSZ',
+    'X-IBD3F',
+    'ST-115',
+    'L-RPIE',
+    'L-IAD',
+    'DTUP-221',
+    'DTUP-220',
+    'L-PIE',
+    'X-DBL1F',
+    'X-DDD4FR',
+    'X-SC',
+    'X-DBO1F',
+    'X-DBD1F',
+    'EOD-15',
+    'EOD-16',
+    'DLYRG-128',
+    'EOD-43',
+    'X-SCSMS',
+    'X-PROM',
+    'FM-101',
+    'DTUP-231',
+    'DLYSOR-101',
+    'DTUP-225',
+    'EOD-6O',
+    'S-MDIN',
+    'DLYLH-133',
+    'DLYDFD-100',
+    'EOD-95',
+    'EOD-134',
+    'DTUP-219',
+    'DLYDC-102',
+    'DLYRG-120',
+    'ST-116',
+    'DTUP-216',
+    'DTUP-232',
+    'DA-101',
+    'DTUP-215',
+    'CLB2B-101',
+    'CL-105',
+    'DTUP-212',
+    'U-EOD',
+    'DTUP-235',
+    'DLYRPC-419',
+    'DLYLH-136',
+    'DLYDC-106',
+    'X-DBO3R',
+    'X-IBD4R',
+    'X-DDD3FD',
+    'RT-101',
+    'X-ILL1F',
+    'X-DRD4R',
+    'X-ILL2F',
+    'X-DDD3FP',
+    'ST-117',
+    'X-IBD1R',
+    'ST-105',
+
+    'S-SURF'
+    )
+    then 
+    '1.OPS'
+     WHEN 
+    cs_nsl
+    in
+    (
+    'RD-PD10',
+    'DLYRG-135',
+    'DLYSHRTBAG-115',
+    'DLYSEC-100',
+    'RD-PD11'
+    )
+    then '3.SECURITY'
+    else '4.Others' end
+    as Tag,
+    cs_sr,date(date_frd +  interval '330' minute) date_frd,
+    date(date_frbd +  interval '330' minute) date_frbd,date(date_frpd +  interval '330' minute) date_frpd, date(scan_date + interval '330' minute) as scan_date,dd_atc,cs_ss as current_status,cs_st as status_type,date(pickup_date  + interval '330' minute) as pickup_date
+    FROM
+     (SELECT wbn, cl, rs, oid,pdt,cs_sl, cs_slid,date_frd,date_frbd,date_frpd,
+             cs_nsl, cs_sr,pt,
+             cs_sd AS scan_date, dd_atc, cs_ss, cs_st, date_pd as pickup_date,
+             row_number() over (partition BY wbn ORDER BY cs_ud DESC) AS rnum
+      FROM express_dwh_3m.package_s3_parquet_3m
+       where ad >= date_format(date_trunc('hour',current_timestamp - interval '91' DAY) - interval '00' MINUTE, '%Y-%m-%d-%H')
+        and cs_sd >= date_trunc('day',current_timestamp - interval '90' day) - interval '330' minute
+       AND wbn not in (select wbn from del_wbns)
+       and cl not like '%DEL LS%'
+       and cl not like '%PALLETTRACKING B2B%'    
+       and cs_sl not like '%LK_%'  
+       and cl not like '%elhivery%'
+       and cl not like '%DIM WEIGHT%'
+       and cl not like '%DLV Internal Test%'
+       and cl not like '%WalletTest3%'
+       and cl not like '%B2B%'
+       and cl not like '%_XB%'
+       and cl not like '%skynet%'
+       )
+    WHERE rnum = 1
+    and cs_slid in (Select distinct id from cn_list)
+    AND cs_ss IN ('Pending','In Transit','Dispatched')
+    AND DATE_DIFF('day', pickup_date,CURRENT_TIMESTAMP) > 30
+    '''
+
+
+    # In[9]:
+
+
+    dump_path = "output_pda30"
+    result=run_query_to_athena(query_pda30, dump_path)
+
+except:
+    from httplib2 import Http
+    from json import dumps
+
+    #
+    # Hangouts Chat incoming webhook quickstart
+    #
+    def main():
+        url = 'https://chat.googleapis.com/v1/spaces/AAAAv-NsrD8/messages?key=AIzaSyDdI0hCZtE6vySjMm-WEfRq3CPzqKqqsHI&token=ypiZOE6OtynvhA5U_sPzg1fdnZVvgrECYAL1c9O7cv8%3D'
+        bot_message = {
+            'text' : 'Alert! PAD30 Report failed.'}
+
+        message_headers = { 'Content-Type': 'application/json; charset=UTF-8'}
+
+        http_obj = Http()
+
+        response = http_obj.request(
+            uri=url,
+            method='POST',
+            headers=message_headers,
+            body=dumps(bot_message),
+        )
+
+        print(response)
+
+    if __name__ == '__main__':
+        main()
+    exit()
+
+
+# In[10]:
+
+
+filename=dump_path + '.csv'
+
+
+# In[11]:
+
+
+data=pd.read_csv(filename)
+
+
+# In[12]:
+
+
+data.shape
+
+
+# In[13]:
+
+
+data.head()
+
+
+# In[14]:
+
+
+from sqlalchemy import create_engine
+engine = create_engine('mysql+mysqlconnector://{0}:{1}@{2}/{3}'.
+                                               format("root", "Delhivery@123", 
+                                                      "lmoa.delhivery.com", "lastmile"))
+
+
+# In[15]:
+
+
+data.to_sql('ageing_pda30', con=engine, if_exists='replace', index=False, chunksize=20000)
+
+
+# In[16]:
+
+
+query_sm=engine.execute('''
+
+SELECT 
+distinct a.*, 
+CASE WHEN b.Region is not null then b.Region else c.region end as Region,
+
+CASE WHEN   b.SM IS NOT NULL THEN  b.SM ELSE c.SM END AS SM,
+CASE WHEN   b.`Directors/Sr Directors` IS NOT NULL THEN  b.`Directors/Sr Directors` ELSE c.`Directors/Sr Directors` END AS `Directors/Sr Directors`
+
+
+
+FROM 
+ageing_pda30 a
+LEFT JOIN
+spoc_latest b
+ON
+a.`cs_sl` = b.`Hq new DC name`
+LEFT JOIN
+spoc_latest c
+ON 
+a.`cs_sl` = c.`hq_name`
+'''
+)
+
+
+# In[17]:
+
+
+data_rolled=pd.DataFrame(query_sm.fetchall())
+
+
+# In[18]:
+
+
+data_rolled.columns=query_sm.keys()
+
+
+# In[19]:
+
+
+data_rolled
+
+
+# In[20]:
+
+
+data_rg=data_rolled.pivot_table(values='wbn', index=['Region','Directors/Sr Directors'],    columns=['Tag'], aggfunc='count', fill_value=0, margins=True)
+
+
+# In[21]:
+
+
+data_sm=data_rolled.pivot_table(values='wbn', index=['Region', 'SM'],   columns=['Tag'], aggfunc='count', fill_value=0, margins=True)
+
+
+# In[22]:
+
+
+data_rolled.to_csv('PDA30_shipments_DC.csv')
+
+
+# In[23]:
+
+
+def mail_send_v2(send_from, send_to, subject, text, html_list=[], html_names=[]):
+        
+    #required for send email function
+    import os
+    from email.mime.text import MIMEText
+    from email.mime.application import MIMEApplication
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email import encoders
+    from os.path import basename
+    import boto.ses
+
+# via http://codeadict.wordpress.com/2010/02/11/send-e-mails-with-attachment-in-python/
+    msg = MIMEMultipart()
+    msg['Subject'] = subject
+    msg['From'] = send_from
+    msg['To'] = send_to
+    print(msg['To'])
+# what a recipient sees if they don't use an email reader
+    msg.preamble = 'Multipart message.\n'
+
+# the message body
+    part = MIMEText(text, 'html')
+    msg.attach(part)
+    
+
+    
+    #attachment
+    attachment = open('PDA30_shipments_DC.csv', "rb") 
+  
+    # instance of MIMEBase and named as p 
+    p = MIMEBase('application', 'octet-stream') 
+  
+    # To change the payload into encoded form 
+    p.set_payload((attachment).read()) 
+      
+    # encode into base64 
+    encoders.encode_base64(p) 
+    
+    p.add_header('Content-Disposition', "attachment; filename= %s" % 'PDA30_shipments_DC.csv') 
+    
+    
+
+    msg.attach(p)
+
+#     #adding footer
+#     #****************************************************************************************#            
+    footer = """
+Regards,
+Returns Operations
+    """
+    footer = MIMEText(footer)
+    msg.attach(footer)
+
+# connect to SES
+    connection = boto.ses.connect_to_region(
+             'us-east-1')
+
+
+# and send the message
+    rec = msg['To'].split(", ")
+    result = connection.send_raw_email(msg.as_string()
+    , source=msg['From']
+    , destinations=rec)
+
+    return(None)
+
+
+# In[24]:
+
+
+
+today = date.today() 
+
+
+# In[25]:
+
+
+sl= 'DCs: PDA30 Ageing Shipments as of ' + str(today)
+
+
+# In[26]:
+
+
+text = '''Hi All,
+
+Please find below the summary of PDA30 shipments - <br><br>PFA the detailed information.<br>''' + data_rg.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">') +'''<br>'''+ data_sm.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">')
+
+
+# In[27]:
+
+rec1='raghav.arora@delhivery.com'
+rec='raghav.arora@delhivery.com, megha.bansal1@delhivery.com, smith.sonkar1@delhivery.com'
+
+
+# In[28]:
+
+
+recipients = 'sanjay.rao@delhivery.com, srishti.srivastava@delhivery.com, rahul.yadav1@delhivery.com, LM_SrDirector-Director@delhivery.com, senior.manager.lm@delhivery.com, lm_operations_analytics@delhivery.com, kunja.joshi@delhivery.com, megha.bansal1@delhivery.com, smith.sonker1@delhivery.com, ankit.badhala@delhivery.com, deepika.chauhan2@delhivery.com, returns_Lead@delhivery.com, lm_engineering@delhivery.com'
+
+
+# In[29]:
+
+
+mail_send_v2("Returns Operations <returns_Lead@delhivery.com>", recipients , sl , text, html_list=[], html_names=[])
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
