@@ -1,0 +1,673 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import date
+import datetime
+import boto3
+
+
+# In[2]:
+
+
+import boto3, csv, time, sys, os, psycopg2,pandas as pd, mysql.connector, re, numpy as np
+
+
+# In[3]:
+
+
+s3 = boto3.resource('s3')
+
+
+# In[4]:
+
+
+from datetime import date, datetime, timedelta
+
+
+# In[5]:
+
+
+from datetime import date
+
+
+# In[6]:
+
+
+tdy=(datetime.today() - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+# In[7]:
+
+
+def run_query(client, query, database, s3_output):
+    response = client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={
+            'Database': database
+        },
+        ResultConfiguration={
+            'OutputLocation': s3_output,
+        }
+    )
+    # print('Execution ID: ' + response['QueryExecutionId'])
+    return response
+
+
+# In[8]:
+
+
+def get_query_status(client, Execution_Id):
+    response = client.get_query_execution(
+        QueryExecutionId=Execution_Id
+    )
+    query_id = response['QueryExecution']['QueryExecutionId']
+    status = response['QueryExecution']['Status']['State']
+    print('Started')
+    print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    while status not in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+        # print('|' + status, end='')
+        time.sleep(30)
+        response = client.get_query_execution(
+            QueryExecutionId=Execution_Id
+        )
+        status = response['QueryExecution']['Status']['State']
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    if status in ['SUCCEEDED']:
+        return True
+    if status in ['FAILED', 'CANCELLED']:
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+        print("Failure Reason: {}".format(
+            response['QueryExecution']['Status'].get('StateChangeReason', 'Error Unknown')))
+        return False
+    else:
+        return False
+
+
+# In[9]:
+
+
+def run_query_to_athena(query, output_filename):
+    client = boto3.client('athena', 'us-east-1' )
+    s3_output = "s3://aws-athena-query-results-190020191201-us-east-1/"
+    s3_bucket="aws-athena-query-results-190020191201-us-east-1"
+    database = 'express_dwh'
+    res = run_query(client, query, database, s3_output)
+
+    q_id = res['QueryExecutionId']
+    if get_query_status(client, q_id):
+        print("Query Successful. Downloading data: ")
+        os.system("aws s3 cp " + s3_output + q_id + ".csv  {}".format(output_filename))
+        s3_key = q_id + '.csv'
+        local_filename = output_filename + '.csv'
+        s3.Bucket(s3_bucket).download_file(s3_key, local_filename)
+
+        return True
+    else:
+        print("Query Unsuccessful. Please check the query or the Athena server status")
+        return False
+
+
+# ## MERGE
+
+# In[59]:
+
+
+fil="LMOA_cron/inputs/IVR/CDR_Answered_Reports_On_" + tdy +'.csv'
+
+
+# In[11]:
+
+
+fil
+
+
+# In[12]:
+
+
+raw_data =pd.read_csv(fil)
+
+
+# In[13]:
+
+
+raw_data['Waybill'] =(raw_data['Waybill'].astype(str)).str.strip('Waybill ')
+
+
+# In[14]:
+
+
+wbn=tuple(raw_data['Waybill'].astype(str).unique())
+
+
+# In[15]:
+
+
+import math
+
+
+# In[16]:
+
+
+wbns=[None] * math.ceil(len(wbn)/10000)
+
+
+# In[17]:
+
+
+wbns
+
+
+# In[18]:
+
+
+for j in range(math.ceil(len(wbn)/10000)):
+    wbns[j] = wbn[j*10000:(j+1)*10000] 
+
+
+# In[19]:
+
+
+ivr_wbn_fe ="""
+
+with
+-- Getting the list of DCs
+cn_list
+as
+(
+select id, cn, cn_type
+from
+(
+select "property_facility_facility_code" as id ,   "property_active" , property_country , "property_facility_name" as cn,"property_facility_facility_type" as cn_type, property_city as city, row_number() over (partition by "property_facility_facility_code"  order by "action_date" desc) as row
+from express_dwh.facility_ad_json
+)
+where row=1
+and upper(cn_type) in ('DC', 'DC,PC')
+and not upper(cn) like '%DPP%' 
+and not upper(cn) like '%3PL%' 
+and  upper(property_country) = 'INDIA'
+and not upper(cn) like 'TEST%'
+
+
+)
+
+select 
+wbn, cn, a.dwbn, fu_emp_id
+from
+(
+select wbn, cn, dwbn
+from
+(
+select wbn, cn, max(cs_dwbn) over (partition by wbn) as dwbn, row_number () over (partition by wbn order by action_date desc) as rnum
+from 
+express_Dwh_3m.package_s3_parquet_3m
+where 
+ad >= date_format((date_trunc('day',current_date) - interval '5' day) - interval '00' minute, '%Y-%m-%d-%H')
+and ad <= date_format((date_trunc('day',current_date) - interval '0' day) - interval '00' minute, '%Y-%m-%d-%H')
+and ldd >= (date_trunc('day',current_timestamp) - interval '4' day) - interval '330' minute
+and ldd <= (date_trunc('day',current_timestamp) - interval '0' day) - interval '330' minute
+and
+wbn in  {}
+
+)
+where rnum = 1
+) a
+left join
+(
+select dwbn, fu_emp_id
+from
+(
+select dwbn, fu_emp_id, row_number() over (partition by dwbn order by action_date desc) as rnum
+from
+dispatch_lm_s3_parquet
+where
+ad >= date_format((date_trunc('day',current_date) - interval '5' day) - interval '00' minute, '%Y-%m-%d-%H')
+and ad <= date_format((date_trunc('day',current_date) - interval '0' day) - interval '00' minute, '%Y-%m-%d-%H')
+and dpd >= (date_trunc('day',current_timestamp) - interval '4' day) - interval '330' minute
+and dpd <= (date_trunc('day',current_timestamp) - interval '0' day) - interval '330' minute
+and cnid in (select distinct id from cn_list)
+)
+where rnum = 1
+)
+b
+on
+a.dwbn = b.dwbn
+
+
+
+
+
+
+
+
+
+
+"""
+
+
+    
+
+
+# In[20]:
+
+
+data=pd.DataFrame()
+
+
+# In[ ]:
+
+
+
+
+
+# In[21]:
+
+
+for i in range(len(wbns)):
+    dump_path = "ivr_wbn_fe_" + str(i)
+    result=run_query_to_athena(ivr_wbn_fe.format(wbns[i]), dump_path)
+    local_filename = dump_path  + '.csv'
+    data0 =pd.read_csv(local_filename)
+    if (i==0):
+        data=data0
+    else:
+        data=pd.concat([data, data0], ignore_index=True)
+    del data0
+
+
+# In[22]:
+
+
+len(data['wbn'].unique())
+
+
+# In[23]:
+
+
+new_data =data.rename(columns={'wbn':'Waybill'})
+
+
+# In[24]:
+
+
+new_data['Waybill'] =(new_data['Waybill'].astype(str)).str.strip('Waybill')
+
+
+# In[25]:
+
+
+merge_data =pd.merge(raw_data, new_data, on='Waybill', how='left')
+
+
+# In[26]:
+
+
+merge_data
+
+
+# ## Checks for missing items
+
+# In[27]:
+
+
+merge_data.loc[merge_data['cn'].isna()]
+
+
+# In[28]:
+
+
+final_data=merge_data.loc[merge_data['cn'].notna()]
+
+
+# In[29]:
+
+
+from sqlalchemy import create_engine
+engine = create_engine('mysql+mysqlconnector://{0}:{1}@{2}/{3}'.
+                                               format("root", "Delhivery@123", 
+                                                      "lmoa.delhivery.com", "lastmile"))
+
+
+# In[30]:
+
+
+final_data.to_sql('IVR_raw', con=engine, if_exists='replace', index=False)
+
+
+# In[31]:
+
+
+query_sm=engine.execute('''
+
+SELECT distinct  a.*, 
+
+CASE WHEN   b.STM IS NOT NULL THEN  b.STM ELSE c.STM END AS STM,
+CASE WHEN   b.SM IS NOT NULL THEN  b.SM ELSE c.SM END AS SM,
+CASE WHEN   b.region IS NOT NULL THEN  b.region ELSE c.region END AS Region,
+CASE WHEN   b.STATE IS NOT NULL THEN  b.STATE ELSE c.STATE END AS State
+
+
+FROM 
+IVR_raw a
+LEFT JOIN
+spoc_latest b
+ON
+a.`cn` = b.`Hq new DC name`
+LEFT JOIN
+spoc_latest c
+ON 
+a.`cn` = c.`hq_name`  ''')
+
+
+# In[32]:
+
+
+data_sm=pd.DataFrame(query_sm.fetchall())
+
+
+# In[33]:
+
+
+data_sm.columns=query_sm.keys()
+
+
+# In[34]:
+
+
+data_sm
+
+
+# In[35]:
+
+
+data_fe_fake= data_sm.loc[data_sm['Option']==1]
+
+
+# In[36]:
+
+
+data_fe_fake.head(2)
+
+
+# In[37]:
+
+
+fe_fake_report=data_fe_fake.groupby(['Region','State','SM','cn','fu_emp_id'],as_index =False).agg({'Waybill':lambda x: x.nunique()})
+
+
+# In[38]:
+
+
+fe_fake_report['len']=fe_fake_report['fu_emp_id'].str.len()
+
+
+# In[39]:
+
+
+fe_fake_report
+
+
+# In[40]:
+
+
+reg_FE_fake= fe_fake_report.loc[fe_fake_report['len']==6]
+
+
+# In[41]:
+
+
+import datetime
+
+
+# In[42]:
+
+
+to_server=reg_FE_fake[['Region','State', 'SM', 'cn', 'fu_emp_id','Waybill' ]]
+
+
+# In[43]:
+
+
+to_server['dt']= (datetime.datetime.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+# In[44]:
+
+
+to_server
+
+
+# In[46]:
+
+
+to_server.to_sql('IVR_FE_stat', con=engine, if_exists='append', index=False)
+
+
+# In[47]:
+
+
+final_fe_summary=reg_FE_fake.loc[reg_FE_fake['Waybill']>1]
+
+
+# In[48]:
+
+
+msg_region_f=final_fe_summary.pivot_table(values='fu_emp_id', index=['Region'], aggfunc='count', fill_value=0, margins=True)
+
+
+# In[49]:
+
+
+msg_region_f=msg_region_f.rename(columns={'fu_emp_id':'Count of Defaulter FE with more than one incorrect remark'})
+
+
+# In[50]:
+
+
+msg_region_f
+
+
+# In[51]:
+
+
+msg_sm_f=final_fe_summary.pivot_table(values='fu_emp_id', index=['Region', 'SM'], aggfunc='count', fill_value=0, margins=True)
+
+
+# In[52]:
+
+
+msg_sm_f=msg_sm_f.rename(columns={'fu_emp_id':'Count of Defaulter FE with more than one incorrect remark '})
+
+
+# In[53]:
+
+
+fe_fake_report_final =fe_fake_report.drop(columns=['len'])
+
+
+# In[54]:
+
+
+fe_fake_report_final.to_csv('fe_fake_report_final.csv')
+
+
+# In[55]:
+
+
+def mail_send_v2(send_from, send_to, subject, text, html_list=[], html_names=[]):
+        
+    #required for send email function
+    import os
+    from email.mime.text import MIMEText
+    from email.mime.application import MIMEApplication
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email.mime.image import MIMEImage
+    from email import encoders
+    from os.path import basename
+    import boto.ses
+
+# via http://codeadict.wordpress.com/2010/02/11/send-e-mails-with-attachment-in-python/
+    msg = MIMEMultipart()
+    msg['Subject'] = subject
+    msg['From'] = send_from
+    msg['To'] = send_to
+    print(msg['To'])
+# what a recipient sees if they don't use an email reader
+    msg.preamble = 'Multipart message.\n'
+
+# the message body
+    part = MIMEText(text, 'html')
+    msg.attach(part)
+    
+    
+    #SNAPDEAL
+    #fp = open('SNAPDEAL.png', 'rb')
+    #msgImage_SNAPDEAL = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_SNAPDEAL.add_header('Content-ID', '<image1>')
+#CLUBFACTORY   
+    #fp = open('CLUBFACTORY.png', 'rb')
+    #msgImage_CLUBFACTORY = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_CLUBFACTORY.add_header('Content-ID', '<image2>')
+#UDAAN   
+    #fp = open('UDAAN.png', 'rb')
+    #msgImage_UDAAN = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_UDAAN.add_header('Content-ID', '<image3>')
+#MEESHO   
+    #fp = open('MEESHO.png', 'rb')
+    #msgImage_MEESHO = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_MEESHO.add_header('Content-ID', '<image4>')
+#LIMEROAD   
+    #fp = open('LIMEROAD.png', 'rb')
+    
+    #msgImage_LIMEROAD = MIMEImage(fp.read())
+    #fp.close()
+    
+ # Define the image's ID as referenced above
+    #msgImage_LIMEROAD.add_header('Content-ID', '<image5>')
+    
+    #attachment
+    attachment = open('fe_fake_report_final.csv', "rb") 
+  
+    # instance of MIMEBase and named as p 
+    p = MIMEBase('application', 'octet-stream') 
+  
+    # To change the payload into encoded form 
+    p.set_payload((attachment).read()) 
+      
+    # encode into base64 
+    encoders.encode_base64(p) 
+    
+    p.add_header('Content-Disposition', "attachment; filename= %s" % 'fe_fake_report_final.csv') 
+    
+    
+    #msg.attach(msgImage_SNAPDEAL)
+    #msg.attach(msgImage_CLUBFACTORY)
+    #msg.attach(msgImage_UDAAN)
+    #msg.attach(msgImage_MEESHO)
+    #msg.attach(msgImage_LIMEROAD)
+    msg.attach(p)
+    
+    
+
+#     #adding footer
+#     #****************************************************************************************#            
+    footer = """
+Regards,
+Last Mile Operations Analytics Team
+    """
+    footer = MIMEText(footer)
+    msg.attach(footer)
+
+# connect to SES
+    connection = boto.ses.connect_to_region(
+             'us-east-1')
+
+
+# and send the message
+    rec = msg['To'].split(", ")
+    result = connection.send_raw_email(msg.as_string()
+    , source=msg['From']
+    , destinations=rec)
+
+    return(None)
+
+
+# In[ ]:
+
+
+
+
+
+# In[56]:
+
+
+subject = 'IVR Report || Defaulter FEs with more than one incorrect remark ' + tdy
+
+
+# In[57]:
+
+
+text = 'Hi All  <br> Please find below the summary of defaulter FEs (Only Regular) with more than one incorrect remark found through IVR on '+ tdy +'<br><br>PFA for detailed information.<br> <br> Region' + msg_region_f.to_html() +'<br> <br> SM wise:'+ msg_sm_f.to_html() +'<br>'
+
+
+# In[58]:
+
+
+mail_send_v2("Analytics Team - LM <lm_operations_analytics@delhivery.com>",'raghav.arora@delhivery.com ',subject,text )
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
