@@ -1,0 +1,1600 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import date
+import datetime
+import boto3
+
+
+# In[2]:
+
+
+import boto3, csv, time, sys, os, psycopg2,pandas as pd, mysql.connector, re, numpy as np
+
+
+# In[3]:
+
+
+s3 = boto3.resource('s3')
+
+
+# In[4]:
+
+
+from datetime import date, datetime, timedelta
+
+
+# In[5]:
+
+
+from datetime import date
+
+
+# In[6]:
+
+
+def run_query(client, query, database, s3_output):
+    response = client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={
+            'Database': database
+        },
+        ResultConfiguration={
+            'OutputLocation': s3_output,
+        }
+    )
+    # print('Execution ID: ' + response['QueryExecutionId'])
+    return response
+
+
+# In[7]:
+
+
+def get_query_status(client, Execution_Id):
+    response = client.get_query_execution(
+        QueryExecutionId=Execution_Id
+    )
+    query_id = response['QueryExecution']['QueryExecutionId']
+    status = response['QueryExecution']['Status']['State']
+    print('Started')
+    print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    while status not in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+        # print('|' + status, end='')
+        time.sleep(30)
+        response = client.get_query_execution(
+            QueryExecutionId=Execution_Id
+        )
+        status = response['QueryExecution']['Status']['State']
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    if status in ['SUCCEEDED']:
+        return True
+    if status in ['FAILED', 'CANCELLED']:
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+        print("Failure Reason: {}".format(
+            response['QueryExecution']['Status'].get('StateChangeReason', 'Error Unknown')))
+        return False
+    else:
+        return False
+
+
+# In[8]:
+
+
+def run_query_to_athena(query, output_filename):
+    client = boto3.client('athena', 'us-east-1' )
+    s3_output = "s3://aws-athena-query-results-190020191201-us-east-1/"
+    s3_bucket="aws-athena-query-results-190020191201-us-east-1"
+    database = 'express_dwh'
+    res = run_query(client, query, database, s3_output)
+
+    q_id = res['QueryExecutionId']
+    if get_query_status(client, q_id):
+        print("Query Successful. Downloading data: ")
+        os.system("aws s3 cp " + s3_output + q_id + ".csv  {}".format(output_filename))
+        s3_key = q_id + '.csv'
+        local_filename = output_filename + '.csv'
+        s3.Bucket(s3_bucket).download_file(s3_key, local_filename)
+
+        return True
+    else:
+        print("Query Unsuccessful. Please check the query or the Athena server status")
+        return False
+
+
+# In[9]:
+
+
+daily_dispatch_data = """
+
+with
+
+
+-- Getting the list of DCs
+cn_list
+as
+(
+select id, cn, cn_type
+from
+(
+select "property_facility_facility_code" as id ,   "property_active" , property_country , "property_facility_name" as cn,"property_facility_facility_type" as cn_type, property_city as city, row_number() over (partition by "property_facility_facility_code"  order by "action_date" desc) as row
+from express_dwh.facility_ad_json
+)
+where row=1
+and upper(cn_type) in ('DC', 'DC,PC')
+and not upper(cn) like '%DPP%' 
+and not upper(cn) like '%3PL%' 
+and  upper(property_country) = 'INDIA'
+and not upper(cn) like 'TEST%'
+and  "property_active" = True
+
+),
+
+fe_doj
+as
+(
+select employee_id, doj, 
+date_diff('day', doj, current_date) as vintage
+from
+   (
+       select employee_id,  case when typeof(dojdt) ='bigint'  then date(from_unixtime(floor(cast(dojdt  as integer)/1000)) + interval '330' minute) 
+       else cast(dojdt as date) end as doj
+               ,row_number() over(partition by employee_id order by action_date desc) as row
+       from ums_user_ad_json
+      where dojdt is not null
+      and length(employee_id) = 6
+       
+   )
+   
+where row = 1
+)
+
+select dpd, cpd, cn, b.dwbn, md, fu_emp_id, wbn_count, eod_dv, eod_pu, eod_ekm, vt, closed, doj, vintage, case when vintage <= 21 then 'New' 
+when vintage >21 then 'Old' else 'Not defined' end as "Old-New", count(distinct case when cs_ss='Delivered' or cs_st='PU'  then wbn end) closure, count(distinct case when cs_ss='Delivered'  or cs_st = 'DT'  then wbn end) dv,
+count(distinct case when cs_st='PU'  then wbn end) pu,
+count(distinct case when cs_ss='Delivered' or cs_st in ('PU','DTO')  then ucid_uci end) Net_Stop_Closure,
+count(distinct case when (cs_ss='Delivered' or cs_st in ('PU','DTO') ) and loc_type='residental' then uan_uai
+                    when (cs_ss='Delivered' or cs_st in ('PU','DTO') ) and loc_type='commercial' then ucid_uci
+                    when (cs_ss='Delivered' or cs_st in ('PU','DTO') ) then ucid_uci end)  as Imprv_Net_Stop_Closure
+from
+(
+select  cs_dwbn dwbn, wbn, ucid_uci, uan_uai, cs_ss, cs_st, loc_type
+from
+(
+select cs_dwbn,  wbn,  ucid_uci,cnid, uan_uai, cs_ss, cs_st, aseg_locality_type as loc_type,
+row_number() over (partition by wbn, cs_dwbn order by action_date desc) rnum
+from
+express_dwh_3m.package_s3_parquet_3m
+where 
+ad >= date_format((date_trunc('day',current_date) - interval '3' day) - interval '00' minute, '%Y-%m-%d-%H')
+and ad <= date_format((date_trunc('day',current_date) - interval '0' day) - interval '00' minute, '%Y-%m-%d-%H')
+and cs_sd >= (date_trunc('day',current_timestamp) - interval '1' day) - interval '330' minute
+and cs_sd <= (date_trunc('day',current_timestamp) - interval '0' day) - interval '330' minute
+and cs_dwbn is not null
+
+)
+where rnum=1
+and cnid in (select distinct id from cn_list)
+) a
+right join
+(
+Select 
+(dpd + interval '330' minute) dpd,
+(cpd + interval '330' minute) cpd,
+cn,
+dwbn,
+case when fu_emp_id like 'GIG%' then 'gig' else md end as md,
+ fu_emp_id ,
+wbn_count, eod_dv, eod_pu,
+coalesce(eod_dv,0) + coalesce(eod_pu,0) as closed,
+vt,
+eod_ekm
+from
+(select dpd, cpd, cn, dwbn, md, fu_emp_id, wbn_count, eod_dv, eod_pu, eod_ekm, vt,
+row_number() over (partition by dwbn order  by action_date desc) rnum
+from 
+dispatch_lm_s3_parquet
+where
+ad >= date_format((date_trunc('day',current_date) - interval '3' day) - interval '00' minute, '%Y-%m-%d-%H')
+and ad <= date_format((date_trunc('day',current_date) - interval '0' day) - interval '00' minute, '%Y-%m-%d-%H')
+and dpd >= (date_trunc('day',current_timestamp) - interval '1' day) - interval '330' minute
+and dpd <= (date_trunc('day',current_timestamp) - interval '0' day) - interval '330' minute
+and cnid in (select distinct id from cn_list)
+)
+where rnum=1
+-- and md=''
+) b
+on a.dwbn=b.dwbn
+left join
+fe_doj c
+on b.fu_emp_id=c.employee_id
+
+
+
+group by 1,2, 3,4, 5, 6, 7, 8, 9, 10, 11,12, 13, 14, 15
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+"""
+
+
+# In[10]:
+
+
+dump_path = "daily_dispatch_data"
+result=run_query_to_athena(daily_dispatch_data, dump_path)
+
+
+# In[11]:
+
+
+local_filename= dump_path + '.csv'
+output_daily_dispatch_data=pd.read_csv(local_filename)
+
+
+# In[12]:
+
+
+from datetime import date
+import datetime
+
+
+# In[13]:
+
+
+date = (datetime.datetime.today() - datetime.timedelta(days=1)).strftime("%d %B %Y")
+
+
+# In[14]:
+
+
+date
+
+
+# In[15]:
+
+
+from sqlalchemy import create_engine
+engine = create_engine('mysql+mysqlconnector://{0}:{1}@{2}/{3}'.
+                                               format("root", "Delhivery@123", 
+                                                      "lmoa.delhivery.com", "lastmile"))
+
+
+# In[16]:
+
+
+output_daily_dispatch_data.to_sql('output_daily_dispatch_data', con=engine, if_exists='replace', index=False)
+
+
+# In[17]:
+
+
+query_sm_rl=engine.execute('''
+
+SELECT distinct  a.*, 
+
+CASE WHEN   b.STM IS NOT NULL THEN  b.STM ELSE c.STM END AS STM,
+CASE WHEN   b.SM IS NOT NULL THEN  b.SM ELSE c.SM END AS SM,
+CASE WHEN   b.region IS NOT NULL THEN  b.region ELSE c.region END AS Region,
+CASE WHEN   b.Target IS NOT NULL THEN  b.Target ELSE c.Target END AS Target,
+CASE WHEN   b.Tier IS NOT NULL THEN  b.Tier ELSE c.Tier END AS Tier,
+CASE WHEN   b.City IS NOT NULL THEN  b.City ELSE c.City END AS City,
+CASE WHEN   b.State IS NOT NULL THEN  b.State ELSE c.State END AS State
+
+
+FROM 
+output_daily_dispatch_data a
+LEFT JOIN
+spoc_latest b
+ON
+a.`cn` = b.`Hq new DC name`
+LEFT JOIN
+spoc_latest c
+ON 
+a.`cn` = c.`hq_name`  ''')
+
+
+# In[18]:
+
+
+data_sm=pd.DataFrame(query_sm_rl.fetchall())
+
+
+# In[19]:
+
+
+data_sm.columns=query_sm_rl.keys()
+
+
+# In[20]:
+
+
+data_sm =data_sm.rename(columns={'Target':'Target Productivity'})
+
+
+# In[21]:
+
+
+data_sm
+
+
+# In[22]:
+
+
+data = data_sm
+
+
+# In[23]:
+
+
+data['vt'] =data['vt'].str.upper()
+
+
+# In[24]:
+
+
+data.vt.unique()
+
+
+# In[25]:
+
+
+not_define_filter =(data['Old-New'] != 'Not defined')
+
+
+# In[26]:
+
+
+veh_type = ("bike".upper(),"footer".upper(), "bicycle".upper() ,"2w electric bike".upper())
+
+
+# In[27]:
+
+
+veh_type
+
+
+# In[28]:
+
+
+veh_filter = data["vt"].isin(veh_type)
+
+
+# In[29]:
+
+
+md_filter = (data["md"]=='regular')
+
+
+# In[30]:
+
+
+regular_data = data.loc[veh_filter & md_filter & not_define_filter ]
+
+
+# In[31]:
+
+
+len(regular_data.cn.unique())
+
+
+# In[32]:
+
+
+regular_data.loc[regular_data.cn =='Sheonor_Moldiyar_D (Bihar)']
+
+
+# In[ ]:
+
+
+
+
+
+# In[33]:
+
+
+region_data=regular_data.groupby(['Region'], as_index=False).agg({ 'fu_emp_id':lambda x: x.nunique() , 'wbn_count': sum ,'closed' :sum,'Imprv_Net_Stop_Closure':sum})
+
+
+# In[34]:
+
+
+regular_data.cn.value_counts().count()
+
+
+# In[ ]:
+
+
+
+
+
+# In[35]:
+
+
+region_data.fu_emp_id.sum()
+
+
+# In[36]:
+
+
+region_data['productivity'] =  region_data['closed'] / region_data['fu_emp_id']
+
+
+# In[37]:
+
+
+region_data['closed %'] = (region_data['closed'] * 100) / region_data['wbn_count']
+
+
+# In[38]:
+
+
+region_data['net_productivity'] = region_data['Imprv_Net_Stop_Closure'] / region_data['fu_emp_id']
+
+
+# In[39]:
+
+
+region_data['fu_emp_id'].sum()
+
+
+# In[40]:
+
+
+region_data
+
+
+# In[ ]:
+
+
+
+
+
+# In[41]:
+
+
+a =region_data.fu_emp_id.sum()
+
+
+# In[42]:
+
+
+b =region_data.closed.sum()
+
+
+# In[43]:
+
+
+c = region_data['closed'].sum() / region_data['fu_emp_id'].sum()
+
+
+# In[44]:
+
+
+d= region_data['Imprv_Net_Stop_Closure'].sum() / region_data['fu_emp_id'].sum()
+
+
+# In[45]:
+
+
+e= (region_data['closed'].sum() * 100) / region_data['wbn_count'].sum()
+
+
+# In[46]:
+
+
+region_wise_productivity = region_data[['Region','fu_emp_id','closed', 'productivity','net_productivity','closed %']]
+
+
+# In[47]:
+
+
+region_wise_productivity
+
+
+# In[48]:
+
+
+region_wise_productivity.loc[4] = 'Total',a,b,c,d,e
+
+
+# In[49]:
+
+
+region_wise_productivity.set_index('Region', inplace = True)
+
+
+# In[50]:
+
+
+region_wise_productivity
+
+
+# In[51]:
+
+
+sm_data=regular_data.groupby(['Region','SM'], as_index=False).agg({ 'fu_emp_id':lambda x: x.nunique() , 'wbn_count': sum ,'closed' :sum,'Imprv_Net_Stop_Closure':sum})
+
+
+# In[52]:
+
+
+sm_data['productivity'] =  sm_data['closed'] / sm_data['fu_emp_id']
+
+
+# In[53]:
+
+
+sm_data['closed %'] = (sm_data['closed'] * 100) / sm_data['wbn_count']
+
+
+# In[54]:
+
+
+sm_data['net_productivity'] = sm_data['Imprv_Net_Stop_Closure'] / sm_data['fu_emp_id']
+
+
+# In[55]:
+
+
+region_wise_sm_productivity = sm_data[['Region','SM','productivity', 'net_productivity','closed %']]
+
+
+# In[56]:
+
+
+f = sm_data['closed'].sum() / sm_data['fu_emp_id'].sum()
+
+
+# In[57]:
+
+
+g = sm_data['Imprv_Net_Stop_Closure'].sum() / sm_data['fu_emp_id'].sum()
+
+
+# In[58]:
+
+
+h = (sm_data['closed'].sum() * 100) / sm_data['wbn_count'].sum()
+
+
+# In[59]:
+
+
+region_wise_sm_productivity.loc[36] = 'Total',' ', f ,g ,h
+
+
+# In[60]:
+
+
+region_wise_sm_productivity.set_index('Region', inplace = True)
+
+
+# In[61]:
+
+
+region_wise_sm_productivity.head()
+
+
+# In[62]:
+
+
+gig_data =data.loc[data['md'] == 'gig']
+
+
+# In[63]:
+
+
+gig_data=gig_data.groupby(['Region'], as_index=False).agg({ 'cn':lambda x: x.nunique() , 'wbn_count': sum ,'closed' :sum})
+
+
+# In[64]:
+
+
+gig_data.set_index('Region', inplace = True)
+
+
+# In[65]:
+
+
+gig_data
+
+
+# In[ ]:
+
+
+
+
+
+# In[66]:
+
+
+cn_base_data=regular_data.groupby(['Region','cn'], as_index=False).agg({ 'fu_emp_id':lambda x: x.nunique() , 'wbn_count': sum ,'closed' :sum,'Target Productivity':max ,'Imprv_Net_Stop_Closure':sum})
+
+
+# In[67]:
+
+
+cn_base_data['productivity'] =  cn_base_data['closed'] / cn_base_data['fu_emp_id']
+
+
+# In[68]:
+
+
+cn_base_data['closed %'] = (cn_base_data['closed'] * 100) / cn_base_data['wbn_count']
+
+
+# In[69]:
+
+
+cn_base_data['net_productivity'] = cn_base_data['Imprv_Net_Stop_Closure'] / cn_base_data['fu_emp_id']
+
+
+# In[70]:
+
+
+cn_base_data.head(1)
+
+
+# In[ ]:
+
+
+
+
+
+# In[71]:
+
+
+cn_base_data['Target'] = np.where((cn_base_data['closed'] >= cn_base_data['Target Productivity']) ,'Target Achieved' , 'Target Not Achieved' )
+
+
+# In[72]:
+
+
+cn_base_data.loc[cn_base_data['cn'] =='Sheonor_Moldiyar_D (Bihar)']
+
+
+# In[73]:
+
+
+cn_base_data
+
+
+# In[74]:
+
+
+cn_productivity = cn_base_data
+
+
+# In[75]:
+
+
+cn_productivity.set_index('Region', inplace = True)
+
+
+# In[76]:
+
+
+cn_productivity.loc[cn_productivity.cn =='Sheonor_Moldiyar_D (Bihar)']
+
+
+# In[77]:
+
+
+regular_data.head(1)
+
+
+# In[78]:
+
+
+target_data = regular_data
+
+
+# In[79]:
+
+
+target_data['Target'] = np.where((target_data['closed'] >= target_data['Target Productivity']) ,'Target Achieve' , 'Target Not Achieve' )
+
+
+# In[80]:
+
+
+fe_level_target = target_data.groupby('Region')['Target'].value_counts().unstack().fillna(0)
+
+
+# In[81]:
+
+
+fe_level_target
+
+
+# In[82]:
+
+
+fe_level_target['Total'] = fe_level_target['Target Achieve'] + fe_level_target['Target Not Achieve']
+
+
+# In[83]:
+
+
+fe_level_target
+
+
+# In[84]:
+
+
+cn_fe_level = target_data.groupby(['Region','cn'])['Target'].value_counts().unstack().fillna(0)
+
+
+# In[ ]:
+
+
+
+
+
+# In[85]:
+
+
+cn_fe_level['Total'] = cn_fe_level['Target Achieve'] + cn_fe_level['Target Not Achieve']
+
+
+# In[86]:
+
+
+target_data.loc[regular_data.cn =='Sheonor_Moldiyar_D (Bihar)']
+
+
+# In[ ]:
+
+
+
+
+
+# In[87]:
+
+
+cn_fe_level.head()
+
+
+# In[88]:
+
+
+cn_base_target = regular_data.groupby(['Region','cn'], as_index=False).agg({ 'fu_emp_id':lambda x: x.nunique() , 'wbn_count': sum ,'closed' :sum,'Imprv_Net_Stop_Closure':sum ,'Target Productivity':max})
+
+
+# In[89]:
+
+
+cn_base_target['Target'] = np.where((cn_base_target['closed'] >= cn_base_target['Target Productivity']) ,'Target Achive' , 'Target Not Achive' )
+
+
+# In[90]:
+
+
+cn_base_target = cn_base_target.groupby(['Region'])['Target'].value_counts().unstack().fillna(0)
+
+
+# In[91]:
+
+
+cn_base_target['Total'] =cn_base_target['Target Achive'] + cn_base_target['Target Not Achive']
+
+
+# In[92]:
+
+
+cn_base_target['Total'].sum()
+
+
+# In[93]:
+
+
+cn_base_target.loc[4] =   cn_base_target['Target Achive'].sum() , cn_base_target['Target Not Achive'].sum() ,cn_base_target['Total'].sum()
+
+
+# In[94]:
+
+
+cn_base_target
+
+
+# In[95]:
+
+
+cn_base_target = cn_base_target.rename(columns={'Target': ' '}, index={4: 'Total'})
+
+
+# In[96]:
+
+
+cn_base_target
+
+
+# In[97]:
+
+
+cn_base_target.columns
+
+
+# ## Region wise Productivity
+
+# In[98]:
+
+
+region_wise_productivity= round(region_wise_productivity ,1)
+
+
+# In[99]:
+
+
+region_wise_productivity =region_wise_productivity.rename(columns={'fu_emp_id':'Total Fe','productivity':'Productivity' ,'net_productivity':'Net Productivity' ,'closed %':'Closure %'})
+
+
+# In[100]:
+
+
+region_wise_productivity
+
+
+# SM Wise Productivity
+
+# In[101]:
+
+
+region_wise_sm_productivity=round(region_wise_sm_productivity ,1)
+
+
+# In[102]:
+
+
+region_wise_sm_productivity = region_wise_sm_productivity.rename(columns = {'productivity':'Productivity'  ,'net_productivity':'Net Productivity' ,'closed %':'Closure %'})
+
+
+# In[ ]:
+
+
+
+
+
+# In[103]:
+
+
+region_wise_sm_productivity.head()
+
+
+# In[104]:
+
+
+region_wise_sm_productivity = region_wise_sm_productivity.rename(columns={'productivity':'Productivity'  ,'net_productivity':'Net ptroductivity' ,'closed %':'Closure %'})
+
+
+# In[105]:
+
+
+region_wise_sm_productivity.head(1)
+
+
+# Gig Use Data
+# 
+
+# In[106]:
+
+
+gig_data.rename(columns ={'cn':'Counts of DC' ,'wbn_count':'Waybill Cout', 'closed':'Closed Shipments'} ,inplace = True)
+
+
+# In[107]:
+
+
+gig_data
+
+
+# 
+# CN Wise Productivity
+# 
+# 
+
+# In[108]:
+
+
+cn_productivity.rename(columns ={'cn':'DC Name'} ,inplace = True)
+
+
+# In[109]:
+
+
+cn_productivity = round(cn_productivity ,1)
+
+
+# In[110]:
+
+
+cn_productivity = cn_productivity.rename(columns={'productivity':'Productivity'  ,'net_productivity':'Net Productivity' ,'closed %':'Closure %'})
+
+
+# In[111]:
+
+
+cn_productivity
+
+
+# In[ ]:
+
+
+
+
+
+# In[112]:
+
+
+lowest_productivity_center = (cn_productivity.sort_values(by =['Productivity'])).head(20)
+
+
+# In[113]:
+
+
+lowest_productivity_center.head(1)
+
+
+# In[ ]:
+
+
+
+
+
+# FE Level Target Achive Data
+
+# In[114]:
+
+
+fe_level_target
+
+
+# CN FE Level Data
+
+# In[115]:
+
+
+cn_fe_level = round(cn_fe_level,0)
+
+
+# In[116]:
+
+
+cn_fe_level.head(1)
+
+
+# In[ ]:
+
+
+
+
+
+# CN Base Target Level
+
+# In[117]:
+
+
+cn_base_target = cn_base_target.rename(columns ={'Target Achive':'Target Achieved','Target Not Achive':'Target Not Achieved'})
+
+
+# In[118]:
+
+
+cn_base_target.columns
+
+
+# In[119]:
+
+
+cn_base_target
+
+
+# In[120]:
+
+
+load_data = data_sm
+
+
+# In[121]:
+
+
+load_data
+
+
+# In[122]:
+
+
+load_data1 =load_data[['Region','State','cn' , 'SM','City','Tier','Target Productivity','wbn_count','md','fu_emp_id','vt','closed','Old-New','closure','Imprv_Net_Stop_Closure']]
+
+
+# In[ ]:
+
+
+
+
+
+# In[123]:
+
+
+load_groupby_data = load_data1.groupby(['cn','md'], as_index=False).agg({'wbn_count': sum})
+
+
+# In[124]:
+
+
+load_groupby_data1 =load_data1.groupby(['Region','cn','State','SM','City','Tier',], as_index=False).agg({ 'fu_emp_id':lambda x: x.nunique() , 'wbn_count': sum ,'closed' :sum,'Imprv_Net_Stop_Closure':sum ,'Target Productivity':max})
+
+
+# In[125]:
+
+
+load_groupby_data1['Productivity'] =  load_groupby_data1['closed'] / load_groupby_data1['fu_emp_id']
+
+
+# In[126]:
+
+
+load_groupby_data1['Net Productivity'] = load_groupby_data1['Imprv_Net_Stop_Closure'] / load_groupby_data1['fu_emp_id']
+
+
+# In[127]:
+
+
+load_groupby_data1['Closure %'] = (load_groupby_data1['closed'] * 100) / load_groupby_data1['wbn_count']
+
+
+# In[128]:
+
+
+load_groupby_data['total_wbn_count'] =load_groupby_data.groupby('cn').wbn_count.transform('sum')
+
+
+# In[129]:
+
+
+load_groupby_data['Load Distribution(%)'] = (load_groupby_data['wbn_count'] * 100 ) / load_groupby_data['total_wbn_count']
+
+
+# In[130]:
+
+
+load_groupby_data.loc[load_groupby_data.cn == 'AMD_Memnagar (Gujarat)']
+
+
+# In[131]:
+
+
+pivot_data = load_groupby_data.pivot(index='cn', columns='md', values='Load Distribution(%)')
+
+
+# In[132]:
+
+
+pivot_data
+
+
+# In[133]:
+
+
+pivot_data = pivot_data.fillna(0)
+
+
+# In[134]:
+
+
+load_final_data = pd.merge(load_groupby_data1, pivot_data, on='cn', how='left')
+
+
+# In[135]:
+
+
+load_final_data['Target Productivity'] = load_final_data['Target Productivity'] /  load_final_data['fu_emp_id']
+
+
+# In[136]:
+
+
+load_final_data1 =load_final_data.rename(columns = {'adhoc': 'Adhoc Load Distribution(%)', 'agent':'Agent Load Distribution(%)','gig':'Gig Load Distribution(%)','regular':'Regular Load Distribution(%)' , 'self_collect':'Self Collect Load Distribution(%)'}) 
+
+
+# In[137]:
+
+
+load_final_data1.set_index('Region', inplace = True)
+
+
+# In[138]:
+
+
+load_final_data1 = round(load_final_data1,1)
+
+
+# In[139]:
+
+
+load_final_data1
+
+
+# In[140]:
+
+
+sm_level_raw_data =load_data1
+
+
+# In[141]:
+
+
+sm_level_raw_data=sm_level_raw_data.groupby(['Region','SM','md'], as_index=False).agg({'wbn_count': sum})
+
+
+# In[142]:
+
+
+sm_level_raw_data['total_wbn_count'] =sm_level_raw_data.groupby('SM').wbn_count.transform('sum')
+
+
+# In[143]:
+
+
+sm_level_raw_data['Load Distribution(%)'] = ((sm_level_raw_data['wbn_count'] * 100 ) / sm_level_raw_data['total_wbn_count'])
+
+
+# In[144]:
+
+
+sm_level_raw_data
+
+
+# In[145]:
+
+
+sm_level_raw_data =sm_level_raw_data.pivot_table(index=['Region','SM'],values='Load Distribution(%)',columns='md' )
+
+
+# In[146]:
+
+
+sm_level_raw_data =round(sm_level_raw_data,1)
+
+
+# In[147]:
+
+
+sm_level_raw_data =sm_level_raw_data.fillna(0)
+
+
+# In[ ]:
+
+
+
+
+
+# In[148]:
+
+
+sm_level_raw_data.columns += ' %'
+
+
+# In[149]:
+
+
+sm_level_raw_data
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[150]:
+
+
+fe_level_closed = regular_data
+
+
+# In[ ]:
+
+
+
+
+
+# In[151]:
+
+
+fe_level_groupby =fe_level_closed.groupby(['Region','cn','fu_emp_id'], as_index=False).agg({'wbn_count':sum ,'closed' :sum ,'Net_Stop_Closure':sum ,'Target Productivity':max  })
+
+
+# In[152]:
+
+
+fe_level_groupby['Target'] = np.where((fe_level_groupby['closed'] >= fe_level_groupby['Target Productivity']) ,'Target Achieved' , 'Target Not Achieved' )
+
+
+# In[153]:
+
+
+len(fe_level_groupby.fu_emp_id.unique())
+
+
+# In[154]:
+
+
+fe_level_groupby.head(1)
+
+
+# In[155]:
+
+
+fe_level_groupby.loc[fe_level_groupby['Target Productivity'] > 72]
+
+
+# In[156]:
+
+
+fe_level_groupby.set_index('Region', inplace = True)
+
+
+# In[157]:
+
+
+fe_level_groupby1 =fe_level_groupby.rename(columns = {'cn':'Dispatch Center','wbn_count':'Dispatch Count','fu_emp_id':'FE ID','closed':'Productivity','Net_Stop_Closure':'Net Productivity'})
+
+
+# In[158]:
+
+
+fe_level_groupby1
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[159]:
+
+
+text = "Hi All  <br> <br> PFB the summary tables for the productivity report.  <br> <b>  <br> Please Note We consider only Regular FEs with vehicle type bike,footer, bicycle and 2w electric bike for the Productivity. <br>  <b>  <br>Region Wise Productivity <br> " " <br>"+  region_wise_productivity.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">')  + " <br> Region SM Wise Productivity <br> " " <br>"+ region_wise_sm_productivity.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">') + " <br> GIG Use Data  <br> " " <br>"+ gig_data.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">')  +  "<br> Center Target Productivity Achieved Or Not  <br> " " <br>"+ cn_base_target.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">')  +  "<br> Load Distribution : SM Wise  <br> " " <br>"+ sm_level_raw_data.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">') 
+
+
+# In[160]:
+
+
+cn_fe_level.to_csv('center_fe_level.csv')
+
+
+# In[161]:
+
+
+cn_productivity.to_csv('center_productivity.csv')  
+
+
+# In[162]:
+
+
+load_final_data1.to_csv('Load_Distribution.csv')
+
+
+# In[163]:
+
+
+fe_level_groupby1.to_csv('Fe_level_closed_data.csv')
+
+
+# In[164]:
+
+
+def mail_send_v2(send_from, send_to, subject, text, html_list=[], html_names=[]):
+        
+    #required for send email function
+    import os
+    from email.mime.text import MIMEText
+    from email.mime.application import MIMEApplication
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email.mime.image import MIMEImage
+    from email import encoders
+    from os.path import basename
+    import boto.ses
+
+# via http://codeadict.wordpress.com/2010/02/11/send-e-mails-with-attachment-in-python/
+    msg = MIMEMultipart()
+    msg['Subject'] = subject
+    msg['From'] = send_from
+    msg['To'] = send_to
+    print(msg['To'])
+# what a recipient sees if they don't use an email reader
+    msg.preamble = 'Multipart message.\n'
+
+# the message body
+    part = MIMEText(text, 'html')
+    msg.attach(part)
+    
+    
+    #SNAPDEAL
+    #fp = open('SNAPDEAL.png', 'rb')
+    #msgImage_SNAPDEAL = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_SNAPDEAL.add_header('Content-ID', '<image1>')
+#CLUBFACTORY   
+    #fp = open('CLUBFACTORY.png', 'rb')
+    #msgImage_CLUBFACTORY = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_CLUBFACTORY.add_header('Content-ID', '<image2>')
+#UDAAN   
+    #fp = open('UDAAN.png', 'rb')
+    #msgImage_UDAAN = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_UDAAN.add_header('Content-ID', '<image3>')
+#MEESHO   
+    #fp = open('MEESHO.png', 'rb')
+    #msgImage_MEESHO = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_MEESHO.add_header('Content-ID', '<image4>')
+#LIMEROAD   
+    #fp = open('LIMEROAD.png', 'rb')
+    
+    #msgImage_LIMEROAD = MIMEImage(fp.read())
+    #fp.close()
+    
+ # Define the image's ID as referenced above
+    #msgImage_LIMEROAD.add_header('Content-ID', '<image5>')
+    
+    #attachment
+    attachment = open('center_fe_level.csv', "rb") 
+  
+    # instance of MIMEBase and named as p 
+    p = MIMEBase('application', 'octet-stream') 
+  
+    # To change the payload into encoded form 
+    p.set_payload((attachment).read()) 
+      
+    # encode into base64 
+    encoders.encode_base64(p) 
+    
+    p.add_header('Content-Disposition', "attachment; filename= %s" % 'center_fe_level.csv') 
+    
+    
+    #msg.attach(msgImage_SNAPDEAL)
+    #msg.attach(msgImage_CLUBFACTORY)
+    #msg.attach(msgImage_UDAAN)
+    #msg.attach(msgImage_MEESHO)
+    #msg.attach(msgImage_LIMEROAD)
+    msg.attach(p)
+    
+    #attachment
+    attachment = open('center_productivity.csv', "rb") 
+  
+    # instance of MIMEBase and named as p 
+    p1 = MIMEBase('application', 'octet-stream') 
+  
+    # To change the payload into encoded form 
+    p1.set_payload((attachment).read()) 
+      
+    # encode into base64 
+    encoders.encode_base64(p1)
+    p1.add_header('Content-Disposition', "attachment; filename= %s" % 'center_productivity.csv')
+    
+    msg.attach(p1)
+    
+    
+    #attachment
+    attachment = open('Load_Distribution.csv', "rb") 
+  
+    # instance of MIMEBase and named as p 
+    p2 = MIMEBase('application', 'octet-stream') 
+  
+    # To change the payload into encoded form 
+    p2.set_payload((attachment).read()) 
+      
+    # encode into base64 
+    encoders.encode_base64(p2)
+    p2.add_header('Content-Disposition', "attachment; filename= %s" % 'Load_Distribution.csv')
+    
+    msg.attach(p2)
+    
+    #attachment
+    attachment = open('Fe_level_closed_data.csv', "rb") 
+  
+    # instance of MIMEBase and named as p 
+    p3 = MIMEBase('application', 'octet-stream') 
+  
+    # To change the payload into encoded form 
+    p3.set_payload((attachment).read()) 
+      
+    # encode into base64 
+    encoders.encode_base64(p3)
+    p3.add_header('Content-Disposition', "attachment; filename= %s" % 'Fe_level_closed_data.csv')
+    
+    msg.attach(p3)
+    
+
+#     #adding footer
+#     #****************************************************************************************#            
+    footer = """
+Regards,
+Last Mile Operations Analytics Team
+    """
+    footer = MIMEText(footer)
+    msg.attach(footer)
+
+# connect to SES
+    connection = boto.ses.connect_to_region(
+             'us-east-1')
+
+
+# and send the message
+    rec = msg['To'].split(", ")
+    result = connection.send_raw_email(msg.as_string()
+    , source=msg['From']
+    , destinations=rec)
+
+    return(None)
+
+
+# In[165]:
+
+
+recipients ='LM_SrDirector-Director@delhivery.com, kunja.joshi@delhivery.com, senior.manager.lm@delhivery.com, lm_operations_analytics@delhivery.com, sanjay.rao@delhivery.com, avni.gupta@delhivery.com, hem.jadeja@delhivery.com, ajith.pai@delhivery.com, amit.agarwal@delhivery.com, priyam.khattar@delhivery.com, shree.vt@delhivery.com, shubham.sharma1@delhivery.com, gourav.vij@delhivery.com, rahul.yadav1@delhivery.com, srishti.srivastava@delhivery.com'
+
+
+# In[166]:
+
+
+subject ='PRODUCTIVITY REPORT ||  '  + date
+
+
+# In[167]:
+
+
+subject
+
+
+# In[168]:
+
+
+mail_send_v2("Analytics Team - LM <lm_operations_analytics@delhivery.com>",'rahul.yadav1@delhivery.com',subject,text )
+
+
+# In[ ]:
+
+
+#mail_send_v2("Analytics Team - LM <lm_operations_analytics@delhivery.com>",recipients,subject,text )
+
+
+# In[ ]:
+
+
+date1 =(datetime.datetime.today() - datetime.timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+# In[ ]:
+
+
+date1
+
+
+# In[ ]:
+
+
+push_cn_productivity  = cn_productivity
+
+
+# In[ ]:
+
+
+push_cn_productivity['date']= date1
+
+
+# In[ ]:
+
+
+push_cn_productivity.head(1)
+
+
+# In[ ]:
+
+
+from sqlalchemy import create_engine
+engine = create_engine('mysql+mysqlconnector://{0}:{1}@{2}/{3}'.
+                                               format("root", "Delhivery@123", 
+                                                      "lmoa.delhivery.com", "lastmile"))
+
+
+# In[ ]:
+
+
+push_cn_productivity.to_sql('lm_dc_daily_productivity', con=engine, if_exists='append', index=False)
+
+
+# In[ ]:
+
+
+push_fe_data =fe_level_groupby1
+
+
+# In[ ]:
+
+
+push_fe_data['date']= date1
+
+
+# In[ ]:
+
+
+push_fe_data.head(1)
+
+
+# In[ ]:
+
+
+push_fe_data.to_sql('fe_daily_data', con=engine, if_exists='append', index=False)
+
+
+# In[ ]:
+
+
+engine.dispose()
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
