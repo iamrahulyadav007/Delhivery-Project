@@ -1,0 +1,513 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import date
+import datetime
+import boto3
+
+
+# In[2]:
+
+
+import boto3, csv, time, sys, os, psycopg2,pandas as pd, mysql.connector, re, numpy as np
+
+
+# In[3]:
+
+
+s3 = boto3.resource('s3')
+
+
+# In[4]:
+
+
+from datetime import date, datetime, timedelta
+
+
+# In[5]:
+
+
+from datetime import date
+
+
+# In[6]:
+
+
+def run_query(client, query, database, s3_output):
+    response = client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={
+            'Database': database
+        },
+        ResultConfiguration={
+            'OutputLocation': s3_output,
+        }
+    )
+    # print('Execution ID: ' + response['QueryExecutionId'])
+    return response
+
+
+# In[7]:
+
+
+def get_query_status(client, Execution_Id):
+    response = client.get_query_execution(
+        QueryExecutionId=Execution_Id
+    )
+    query_id = response['QueryExecution']['QueryExecutionId']
+    status = response['QueryExecution']['Status']['State']
+    print('Started')
+    print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    while status not in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+        # print('|' + status, end='')
+        time.sleep(30)
+        response = client.get_query_execution(
+            QueryExecutionId=Execution_Id
+        )
+        status = response['QueryExecution']['Status']['State']
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    if status in ['SUCCEEDED']:
+        return True
+    if status in ['FAILED', 'CANCELLED']:
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+        print("Failure Reason: {}".format(
+            response['QueryExecution']['Status'].get('StateChangeReason', 'Error Unknown')))
+        return False
+    else:
+        return False
+
+
+# In[8]:
+
+
+def run_query_to_athena(query, output_filename):
+    client = boto3.client('athena', 'us-east-1' )
+    s3_output = "s3://aws-athena-query-results-190020191201-us-east-1/"
+    s3_bucket="aws-athena-query-results-190020191201-us-east-1"
+    database = 'express_dwh'
+    res = run_query(client, query, database, s3_output)
+
+    q_id = res['QueryExecutionId']
+    if get_query_status(client, q_id):
+        print("Query Successful. Downloading data: ")
+        os.system("aws s3 cp " + s3_output + q_id + ".csv  {}".format(output_filename))
+        s3_key = q_id + '.csv'
+        local_filename = output_filename + '.csv'
+        s3.Bucket(s3_bucket).download_file(s3_key, local_filename)
+
+        return True
+    else:
+        print("Query Unsuccessful. Please check the query or the Athena server status")
+        return False
+
+
+# In[9]:
+
+
+open_tickets = """
+
+
+with
+cn_list
+as
+(
+select id, cn, cn_type
+from
+(
+select "property_facility_facility_code" as id ,   "property_active" , property_country , "property_facility_name" as cn,"property_facility_facility_type" as cn_type, property_city as city, row_number() over (partition by "property_facility_facility_code"  order by "action_date" desc) as row
+from express_dwh.facility_ad_json
+)
+where row=1
+and upper(cn_type) in ('DC', 'DC,PC')
+and not upper(cn) like '%DPP%' 
+and not upper(cn) like '%3PL%' 
+and  upper(property_country) = 'INDIA'
+and not upper(cn) like 'TEST%'
+and  "property_active" = True
+
+),
+
+temp_esc as
+(
+select * 
+from
+(
+select awb_no, ticket_id,status,sub_outcome,from_unixtime((created_on)) + interval '330' minute created, 
+date_diff('minute',from_unixtime((created_on)), current_timestamp )/ (60*24) as Ageing
+from
+(
+select ticket_id,awb_no, sub_outcome,status,created_on,row_number() over (partition by ticket_id order by action_date desc) row
+from
+express_dwh.escalations_ticket_ad_json
+where
+
+ad >= date_format((date_trunc('day',current_date) - interval '30' day) - interval '00' minute, '%Y-%m-%d-%H')
+and
+from_unixtime((created_on))  >=    (date_trunc('day',current_timestamp) - interval '30' day) - interval '330' minute
+and  from_unixtime((created_on)) <=  (date_trunc('day',current_timestamp) - interval '0' day) - interval '330' minute
+and outcome = 'Branch/FE related'
+and sub_outcome in ('Fake remarks by FE', 'FE misbehaved', 'FE charged extra money', 'FE denied doorstep Delivery')
+)
+where
+row=1
+and status = 'Open' 
+)
+)
+select a.*,cn, fu_emp_id
+from
+temp_esc a
+join
+(
+select wbn, cn, dwbn
+from
+(
+select wbn, cn, cnid,max(cs_dwbn) over (partition by wbn) as dwbn,  row_number() over (partition by wbn order by action_date desc) rown
+from express_dwh_3m.package_S3_parquet_3m
+where 
+ad >= date_format((date_trunc('day',current_date) - interval '90' day) - interval '00' minute, '%Y-%m-%d-%H')
+and wbn in (Select distinct awb_no from temp_esc)
+)
+where rown =1
+and cnid in (select distinct id from cn_list)
+) b
+on
+a.awb_no =b.wbn
+left join
+(
+select dwbn, fu_emp_id, (dpd + interval '330' minute) dpd
+from
+(
+select dwbn, fu_emp_id, dpd, md, row_number() over (partition by dwbn order by action_date desc) rnum
+from
+dispatch_lm_s3_parquet
+where
+ad >= date_format((date_trunc('day',current_date) - interval '90' day) - interval '00' minute, '%Y-%m-%d-%H')
+
+and length(fu_emp_id) = 6 
+and upper(md) = 'REGULAR'
+
+)
+
+where rnum=1
+
+
+) c
+on
+b.dwbn=c.dwbn and dpd <  created
+
+
+
+
+
+
+
+
+"""
+
+
+# In[10]:
+
+
+dump_path = "open_tickets"
+result=run_query_to_athena(open_tickets, dump_path)
+
+
+# In[11]:
+
+
+local_filename= dump_path + '.csv'
+output_open_tickets =pd.read_csv(local_filename)
+
+
+# In[12]:
+
+
+output_open_tickets
+
+
+# In[ ]:
+
+
+
+
+
+# In[13]:
+
+
+output_open_tickets.isna().sum()
+
+
+# In[14]:
+
+
+from sqlalchemy import create_engine
+engine = create_engine('mysql+mysqlconnector://{0}:{1}@{2}/{3}'.
+                                               format("root", "Delhivery@123", 
+                                                      "lmoa.delhivery.com", "lastmile"))
+
+
+# In[15]:
+
+
+output_open_tickets.to_sql('output_open_tickets', con=engine, if_exists='replace', index=False)
+
+
+# In[16]:
+
+
+query_sm_rl=engine.execute('''
+
+SELECT distinct  a.*, 
+
+CASE WHEN   b.STM IS NOT NULL THEN  b.STM ELSE c.STM END AS STM,
+CASE WHEN   b.SM IS NOT NULL THEN  b.SM ELSE c.SM END AS SM,
+CASE WHEN   b.region IS NOT NULL THEN  b.region ELSE c.region END AS Region
+
+FROM 
+output_open_tickets a
+LEFT JOIN
+spoc_latest b
+ON
+a.`cn` = b.`Hq new DC name`
+LEFT JOIN
+spoc_latest c
+ON 
+a.`cn` = c.`hq_name`  ''')
+
+
+# In[17]:
+
+
+data_sm=pd.DataFrame(query_sm_rl.fetchall())
+
+
+# In[18]:
+
+
+data_sm.columns=query_sm_rl.keys()
+
+
+# In[19]:
+
+
+raw_data =data_sm
+
+
+# In[20]:
+
+
+raw_data
+
+
+# In[21]:
+
+
+region_wise_counts=raw_data.pivot_table(index=['Region'],values='awb_no', columns=['sub_outcome'] , aggfunc=pd.Series.nunique, fill_value=0, margins=True)
+
+
+# In[22]:
+
+
+region_wise_counts
+
+
+# In[ ]:
+
+
+
+
+
+# In[23]:
+
+
+sm_wise_counts =raw_data.pivot_table(index=['Region','SM'],values='awb_no', columns=['sub_outcome'] , aggfunc=pd.Series.nunique, fill_value=0, margins=True)
+
+
+# In[24]:
+
+
+sm_wise_counts
+
+
+# In[25]:
+
+
+raw_data
+
+
+# In[26]:
+
+
+fe_raw_data =raw_data.pivot_table(index=['Region','SM','fu_emp_id'],values='awb_no', aggfunc=pd.Series.nunique)
+
+
+# In[27]:
+
+
+fe_raw_data.reset_index(inplace = True) 
+
+
+# In[28]:
+
+
+more_than_one_mistake_data = fe_raw_data.loc[fe_raw_data.awb_no > 1]
+
+
+# In[29]:
+
+
+count_of_fe_more_than_one_mistake =more_than_one_mistake_data.pivot_table(index=['Region','SM'],values='fu_emp_id' , aggfunc='count')
+
+
+# In[30]:
+
+
+count_of_fe_more_than_one_mistake =count_of_fe_more_than_one_mistake.rename(columns={'fu_emp_id':'Counts of FE'})
+
+
+# In[31]:
+
+
+count_of_fe_more_than_one_mistake
+
+
+# In[32]:
+
+
+raw_data.to_csv('raw_data.csv')
+
+
+# In[33]:
+
+
+def mail_send_v2(send_from, send_to, subject, text, html_list=[], html_names=[]):
+        
+    #required for send email function
+    import os
+    from email.mime.text import MIMEText
+    from email.mime.application import MIMEApplication
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email.mime.image import MIMEImage
+    from email import encoders
+    from os.path import basename
+    import boto.ses
+
+# via http://codeadict.wordpress.com/2010/02/11/send-e-mails-with-attachment-in-python/
+    msg = MIMEMultipart()
+    msg['Subject'] = subject
+    msg['From'] = send_from
+    msg['To'] = send_to
+    print(msg['To'])
+# what a recipient sees if they don't use an email reader
+    msg.preamble = 'Multipart message.\n'
+
+# the message body
+    part = MIMEText(text, 'html')
+    msg.attach(part)
+    
+    
+        
+    #attachment
+    attachment = open('raw_data.csv', "rb") 
+  
+    # instance of MIMEBase and named as p 
+    p = MIMEBase('application', 'octet-stream') 
+  
+    # To change the payload into encoded form 
+    p.set_payload((attachment).read()) 
+      
+    # encode into base64 
+    encoders.encode_base64(p) 
+    
+    p.add_header('Content-Disposition', "attachment; filename= %s" % 'raw_data.csv') 
+    
+    
+    msg.attach(p)
+    
+    
+
+#     #adding footer
+#     #****************************************************************************************#            
+    footer = """
+Regards,
+Last Mile Operations Analytics Team
+    """
+    footer = MIMEText(footer)
+    msg.attach(footer)
+
+# connect to SES
+    connection = boto.ses.connect_to_region(
+             'us-east-1')
+
+
+# and send the message
+    rec = msg['To'].split(", ")
+    result = connection.send_raw_email(msg.as_string()
+    , source=msg['From']
+    , destinations=rec)
+
+    return(None)
+
+
+# In[34]:
+
+
+import datetime
+
+
+# In[35]:
+
+
+date = (datetime.datetime.today() - datetime.timedelta(days=1)).strftime("%d %B %Y")
+
+
+# In[36]:
+
+
+subject = 'OPEN TICKETS  ' + date
+
+
+# In[37]:
+
+
+recipients = 'sanjay.rao@delhivery.com, LM_SrDirector-Director@delhivery.com, senior.manager.lm@delhivery.com, lm_operations_analytics@delhivery.com, kunja.joshi@delhivery.com, lm_engineering@delhivery.com, rahul.yadav1@delhivery.com, srishti.srivastava@delhivery.com'
+
+
+# In[38]:
+
+
+text = "Hi All  <br> <br> PFB the summary tables for OPEN TICKETS.  <br> Region Wise OPEN TICKETS COUNTS WITH REMARKS <br> " " <br>"+ region_wise_counts.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">') +  '<br> SM Wise OPEN TICKETS COUNTS WITH REMARKS <br>   <br>'+  sm_wise_counts.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">') +  '<br> SM Wise : Count of Regular FEs with more than one waybill (Escalation) <br>   <br>'+  count_of_fe_more_than_one_mistake.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">')
+
+
+# In[39]:
+
+
+mail_send_v2("Analytics Team - LM <lm_operations_analytics@delhivery.com>",'rahul.yadav1@delhivery.com',subject,text )
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
