@@ -1,0 +1,577 @@
+#!/usr/bin/env python
+# coding: utf-8
+
+# In[1]:
+
+
+import pandas as pd
+import numpy as np
+import matplotlib.pyplot as plt
+from datetime import date
+import datetime
+import boto3
+
+
+# In[2]:
+
+
+import boto3, csv, time, sys, os, psycopg2,pandas as pd, mysql.connector, re, numpy as np
+
+
+# In[3]:
+
+
+s3 = boto3.resource('s3')
+
+
+# In[4]:
+
+
+from datetime import date, datetime, timedelta
+
+
+# In[5]:
+
+
+from datetime import date
+
+
+# In[6]:
+
+
+def run_query(client, query, database, s3_output):
+    response = client.start_query_execution(
+        QueryString=query,
+        QueryExecutionContext={
+            'Database': database
+        },
+        ResultConfiguration={
+            'OutputLocation': s3_output,
+        }
+    )
+    # print('Execution ID: ' + response['QueryExecutionId'])
+    return response
+
+
+# In[7]:
+
+
+def get_query_status(client, Execution_Id):
+    response = client.get_query_execution(
+        QueryExecutionId=Execution_Id
+    )
+    query_id = response['QueryExecution']['QueryExecutionId']
+    status = response['QueryExecution']['Status']['State']
+    print('Started')
+    print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    while status not in ['SUCCEEDED', 'FAILED', 'CANCELLED']:
+        # print('|' + status, end='')
+        time.sleep(30)
+        response = client.get_query_execution(
+            QueryExecutionId=Execution_Id
+        )
+        status = response['QueryExecution']['Status']['State']
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+
+    if status in ['SUCCEEDED']:
+        return True
+    if status in ['FAILED', 'CANCELLED']:
+        print("{}: Query ID {} : {}".format(str(datetime.now()), query_id, status))
+        print("Failure Reason: {}".format(
+            response['QueryExecution']['Status'].get('StateChangeReason', 'Error Unknown')))
+        return False
+    else:
+        return False
+
+
+# In[8]:
+
+
+def run_query_to_athena(query, output_filename):
+    client = boto3.client('athena', 'us-east-1' )
+    s3_output = "s3://aws-athena-query-results-190020191201-us-east-1/"
+    s3_bucket="aws-athena-query-results-190020191201-us-east-1"
+    database = 'express_dwh'
+    res = run_query(client, query, database, s3_output)
+
+    q_id = res['QueryExecutionId']
+    if get_query_status(client, q_id):
+        print("Query Successful. Downloading data: ")
+        os.system("aws s3 cp " + s3_output + q_id + ".csv  {}".format(output_filename))
+        s3_key = q_id + '.csv'
+        local_filename = output_filename + '.csv'
+        s3.Bucket(s3_bucket).download_file(s3_key, local_filename)
+
+        return True
+    else:
+        print("Query Unsuccessful. Please check the query or the Athena server status")
+        exit()
+        return False
+
+
+# In[140]:
+
+
+client_fdds_with_hours = """
+
+with cn_list
+as
+(
+select id, cn, cn_type, region
+from
+(
+select "property_facility_facility_code" as id , "property_facility_name" as cn,"property_facility_facility_type" as cn_type, property_city as city,property_zone as region,  row_number() over (partition by "property_facility_facility_code"  order by "action_date" desc) as row
+from express_dwh.facility_ad_json
+
+where "property_active" = True
+)
+where row=1
+and upper(cn_type) in ('DC', 'DC,PC')
+and not upper(cn) like '%DPP%' 
+and not upper(cn) like '%3PL%' 
+and  upper(id) like 'IN%'
+and not upper(cn) like 'TEST%'
+)
+select a.cn, attempt_date,hour, client, Region,pt "Payment type",fdd,total
+from
+(
+select cnid,  cn, date(fadt) Attempt_date, hour(fadt) as hour,
+client,pt,sum(fdd) as fdd,count(wbn) as total
+-- sum(case when "pt"='COD' then 1 else 0 end) COD,
+-- sum(case when "pt"='COD' then fdd else 0 end) cod_FDDS,
+-- sum(case when "pt"='Pre-paid' then 1 else 0 end) "Pre-Paid",
+-- sum(case when "pt"='Pre-paid' then fdd else 0 end) "PP_FDDS",
+-- coalesce(sum(case when "pt"='COD' then 1 else 0 end),0) + coalesce(sum(case when "pt"='Pre-paid' then 1 else 0 end),0)  total_Volume,
+-- sum(fdd) total_FDDS
+from
+(
+select cnid, cn,  "date_fadt"+ interval '330' minute fadt,
+CASE
+when
+ upper(cl) like '%SNAPDEAL%' THEN 'SNAPDEAL'
+ when
+Upper(cl) like '%CLUBFACTORY%' THEN 'CLUBFACTORY'
+when
+upper(cl) like 'FTPL%' THEN 'MEESHO'
+when
+upper(cl) like '%GLOWROAD%' THEN 'GLOWROAD'
+when
+upper(cl) like '%UDAAN%' THEN 'UDAAN'
+when
+upper(cl) like '%LIMEROAD%' THEN 'LIMEROAD'
+end
+as client
+,"pt","wbn",ss,"cs_st",
+(case when (ss ='Delivered' and date("date_fadt"+ interval '330' minute)=date("ldd"+ interval '330' minute)) then 1 else 0 end) fdd
+from
+(
+select cnid,  cl,Pt, cn, wbn,"dd_dct","cs_sd","cs_ss" ss,"cs_st","ldd","date_fadt", row_number() over (partition by wbn order by action_date desc) as row
+from express_dwh_3m.package_s3_parquet_3m
+where 
+ad >= date_format((date_trunc('day',current_date) - interval '2' day) - interval '00' minute, '%Y-%m-%d-%H')
+and ad <= date_format((date_trunc('day',current_date) - interval '0' day) - interval '00' minute, '%Y-%m-%d-%H')
+and cs_sd >= (date_trunc('day',current_timestamp) - interval '1' day) - interval '330' minute
+and cs_sd <= (date_trunc('day',current_timestamp) - interval '0' day) - interval '330' minute
+and date_fadt >= (date_trunc('day',current_timestamp) - interval '1' day) - interval '330' minute
+and date_fadt <= (date_trunc('day',current_timestamp) - interval '0' day) - interval '330' minute
+and  "pdt"in ('','NEXT_B2C_SURFACE','FLASH_B2C_SURFACE','FLASH_B2C_AIR','DOC_FLASH')
+and pt in ('COD','Pre-paid')
+) aa
+where row=1
+
+and cnid in (Select distinct id from cn_list)
+and ( upper(cl) like '%SNAPDEAL%'
+or
+Upper(cl) like '%CLUBFACTORY%'
+or
+upper(cl) like 'FTPL%'
+
+or
+upper(cl) like '%GLOWROAD%'
+or
+upper(cl) like '%UDAAN%'
+or
+upper(cl) like '%LIMEROAD%'
+)
+
+) bb
+where fadt is not null
+group by 1,2,3,4,5,6
+
+) a
+join 
+cn_list b
+on a.cnid=b.id
+
+
+
+
+
+
+
+"""
+
+
+# In[141]:
+
+
+dump_path = "client_fdds_with_hours"
+result=run_query_to_athena(client_fdds_with_hours, dump_path)
+
+
+# In[144]:
+
+
+local_filename= dump_path + '.csv'
+output_client_fdds_with_hours =pd.read_csv(local_filename)
+
+
+# In[145]:
+
+
+output_client_fdds_with_hours
+
+
+# In[ ]:
+
+
+
+
+
+# In[146]:
+
+
+output_client_fdds_with_hours.isna().sum()
+
+
+# In[159]:
+
+
+from sqlalchemy import create_engine
+engine = create_engine('mysql+mysqlconnector://{0}:{1}@{2}/{3}'.
+                                               format("root", "Delhivery@123", 
+                                                      "lmoa.delhivery.com", "lastmile"))
+
+
+# In[160]:
+
+
+output_client_fdds_with_hours.to_sql('output_client_fdds_with_hours', con=engine, if_exists='replace', index=False, chunksize=10000)
+
+
+# In[161]:
+
+
+run_level_fdds_query=engine.execute('''
+
+SELECT distinct  a.*, 
+
+CASE WHEN   b.STM IS NOT NULL THEN  b.STM ELSE c.STM END AS STM,
+CASE WHEN   b.SM IS NOT NULL THEN  b.SM ELSE c.SM END AS SM
+
+FROM 
+output_client_fdds_with_hours a
+LEFT JOIN
+spoc_latest b
+ON
+a.`cn` = b.`Hq new DC name`
+LEFT JOIN
+spoc_latest c
+ON 
+a.`cn` = c.`hq_name`  ''')
+
+
+# In[162]:
+
+
+run_level_fdds_data=pd.DataFrame(run_level_fdds_query.fetchall())
+
+
+# In[163]:
+
+
+run_level_fdds_data.columns=run_level_fdds_query.keys()
+
+
+# In[ ]:
+
+
+
+
+
+# In[164]:
+
+
+run_level_fdds_data
+
+
+# In[165]:
+
+
+run_level_fdds_data['hours labels'] =pd.cut(run_level_fdds_data['hour'], bins=[0, 9, 12,15,24], labels=['Before 9 am', '9 to 12 pm','12 to 3 pm','After 3 pm'], right=False)
+
+
+# In[166]:
+
+
+# raw_data_client_fdds_with_hours['fdd %'] =raw_data_client_fdds_with_hours.fdd * 100 / raw_data_client_fdds_with_hours.total
+
+
+# In[167]:
+
+
+run_level_fdds_data
+
+
+# In[ ]:
+
+
+
+
+
+# In[168]:
+
+
+region_wise_fdds_with_hours_counts=run_level_fdds_data.pivot_table(index=['Region'],values=['total','fdd'], columns=['Payment type','hours labels'] , aggfunc='sum', fill_value=0)
+
+
+# In[169]:
+
+
+region_wise_fdds_with_hours_counts
+
+
+# In[170]:
+
+
+dump_df=region_wise_fdds_with_hours_counts['total'].merge((round(((region_wise_fdds_with_hours_counts['fdd']/region_wise_fdds_with_hours_counts['total'])* 100) ,1)).astype('str') + '%' , on = 'Region')
+
+
+# In[171]:
+
+
+dump_df
+
+
+# In[205]:
+
+
+region_wise_fdds_volume=dump_df.rename(columns={'COD_x':'COD Volume','Pre-paid_x':'Pre-paid Volume','All_x':'All','COD_y':'COD FDDS %','Pre-paid_y':'Pre-paid FDDS %','All_y':'All'})
+
+
+# In[206]:
+
+
+region_wise_fdds_volume
+
+
+# In[207]:
+
+
+sm_level_fdds_volumne =run_level_fdds_data.pivot_table(index=['Region','SM'],values=['total','fdd'], columns=['Payment type','hours labels'] , aggfunc='sum', fill_value=0)
+
+
+# In[208]:
+
+
+dump_df_sm_level =sm_level_fdds_volumne['total'].merge((round(((sm_level_fdds_volumne['fdd']/sm_level_fdds_volumne['total'])* 100) ,1)).astype('str') + '%' , on = ['Region','SM'])
+
+
+# In[209]:
+
+
+sm_wise_fdds_volume =dump_df_sm_level.rename(columns={'COD_x':'COD Volume','Pre-paid_x':'Pre-paid Volume','All_x':'All','COD_y':'COD FDDS %','Pre-paid_y':'Pre-paid FDDS %','All_y':'All'})
+
+
+# In[210]:
+
+
+sm_wise_fdds_volume
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[211]:
+
+
+run_level_fdds_data.to_csv('run_level_fdds_data.csv')
+
+
+# In[212]:
+
+
+def mail_send_v2(send_from, send_to, subject, text, html_list=[], html_names=[]):
+        
+    #required for send email function
+    import os
+    from email.mime.text import MIMEText
+    from email.mime.application import MIMEApplication
+    from email.mime.multipart import MIMEMultipart
+    from email.mime.base import MIMEBase
+    from email.mime.image import MIMEImage
+    from email import encoders
+    from os.path import basename
+    import boto.ses
+
+# via http://codeadict.wordpress.com/2010/02/11/send-e-mails-with-attachment-in-python/
+    msg = MIMEMultipart()
+    msg['Subject'] = subject
+    msg['From'] = send_from
+    msg['To'] = send_to
+    print(msg['To'])
+# what a recipient sees if they don't use an email reader
+    msg.preamble = 'Multipart message.\n'
+
+# the message body
+    part = MIMEText(text, 'html')
+    msg.attach(part)
+    
+    
+    #SNAPDEAL
+    #fp = open('SNAPDEAL.png', 'rb')
+    #msgImage_SNAPDEAL = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_SNAPDEAL.add_header('Content-ID', '<image1>')
+#CLUBFACTORY   
+    #fp = open('CLUBFACTORY.png', 'rb')
+    #msgImage_CLUBFACTORY = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_CLUBFACTORY.add_header('Content-ID', '<image2>')
+#UDAAN   
+    #fp = open('UDAAN.png', 'rb')
+    #msgImage_UDAAN = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_UDAAN.add_header('Content-ID', '<image3>')
+#MEESHO   
+    #fp = open('MEESHO.png', 'rb')
+    #msgImage_MEESHO = MIMEImage(fp.read())
+    #fp.close()
+
+    # Define the image's ID as referenced above
+    #msgImage_MEESHO.add_header('Content-ID', '<image4>')
+#LIMEROAD   
+    #fp = open('LIMEROAD.png', 'rb')
+    
+    #msgImage_LIMEROAD = MIMEImage(fp.read())
+    #fp.close()
+    
+ # Define the image's ID as referenced above
+    #msgImage_LIMEROAD.add_header('Content-ID', '<image5>')
+    
+    #attachment
+    attachment = open('run_level_fdds_data.csv', "rb") 
+  
+    # instance of MIMEBase and named as p 
+    p = MIMEBase('application', 'octet-stream') 
+  
+    # To change the payload into encoded form 
+    p.set_payload((attachment).read()) 
+      
+    # encode into base64 
+    encoders.encode_base64(p) 
+    
+    p.add_header('Content-Disposition', "attachment; filename= %s" % 'run_level_fdds_data.csv') 
+    
+    
+    #msg.attach(msgImage_SNAPDEAL)
+    #msg.attach(msgImage_CLUBFACTORY)
+    #msg.attach(msgImage_UDAAN)
+    #msg.attach(msgImage_MEESHO)
+    #msg.attach(msgImage_LIMEROAD)
+    msg.attach(p)
+    
+    
+
+#     #adding footer
+#     #****************************************************************************************#            
+    footer = """
+Regards,
+Last Mile Operations Analytics Team
+    """
+    footer = MIMEText(footer)
+    msg.attach(footer)
+
+# connect to SES
+    connection = boto.ses.connect_to_region(
+             'us-east-1')
+
+
+# and send the message
+    rec = msg['To'].split(", ")
+    result = connection.send_raw_email(msg.as_string()
+    , source=msg['From']
+    , destinations=rec)
+
+    return(None)
+
+
+# In[213]:
+
+
+import datetime
+
+
+# In[214]:
+
+
+date = (datetime.datetime.today() - datetime.timedelta(days=1)).strftime("%d %B %Y")
+
+
+# In[215]:
+
+
+subject = 'FDDS with Hours Labels  ' + date
+
+
+# In[216]:
+
+
+recipients = 'sanjay.rao@delhivery.com, LM_SrDirector-Director@delhivery.com, senior.manager.lm@delhivery.com, lm_operations_analytics@delhivery.com, kunja.joshi@delhivery.com, lm_engineering@delhivery.com, rahul.yadav1@delhivery.com, srishti.srivastava@delhivery.com'
+
+
+# In[217]:
+
+
+text = "Hi All  <br> <br> PFB the summary tables for FDDS With Hours Labels.  <br> Region Wise FDDS <br> " " <br>"+ region_wise_fdds_volume.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">') +  '<br> SM Wise FDDS <br>   <br>'+  sm_wise_fdds_volume.to_html().replace('<th>','<th style = "background-color:#009090"><font font="Arial" color="#fffff">')
+
+
+# In[218]:
+
+
+mail_send_v2("Analytics Team - LM <lm_operations_analytics@delhivery.com>",'rahul.yadav1@delhivery.com',subject,text )
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
+
+# In[ ]:
+
+
+
+
