@@ -1,0 +1,98 @@
+import pylab
+print(pylab)
+
+import matplotlib.pyplot as plt
+
+
+# for i in clients:
+#     data_clients_plot= client_data_final.loc[client_data_final['Client'] == i]
+#     ax = plt.gca()
+#     data_clients_plot.plot(kind='line', x='Attempt date', y='COD FDDS %', marker='o', color='#ee0000', ax=ax)
+#     data_clients_plot.plot(kind='line', x='Attempt date', y='Prepaid FDDS %',marker='o',  color='#ff8000', ax=ax)
+#     data_clients_plot.plot(kind='line', x='Attempt date', y='Overall FDDS %', marker='o', color='#00ff00', ax=ax)
+#     ax.legend(bbox_to_anchor=(1.1, 1.05))
+#     plt.title(i)
+#     lgd = ax.legend(loc=9, bbox_to_anchor=(1.2,1))
+#     fig1 = plt.gcf()
+#     plt.draw()
+#     fig1.savefig(i+'.png', dpi=100, bbox_extra_artists=(lgd,), bbox_inches='tight')
+#     plt.show()
+#     plt.clf()
+
+for i in clients:
+    data_clients_plot= client_data_final.loc[client_data_final['Client'] == i]
+   
+    fig = plt.figure()
+    ax1 = fig.add_subplot(221)
+   
+    ax1.plot(data_clients_plot.loc[data_clients_plot.Region =='East']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='East']['COD FDDS %'] ,marker='o',color='r' )
+    ax1.grid('on', which='major', axis='y' )
+    ax1.grid('on', which='major', axis='x' )
+   
+    ax1 = fig.add_subplot(221)
+    ax1.plot(data_clients_plot.loc[data_clients_plot.Region =='East']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='East']['Overall FDDS %'] ,marker='o',color='b' )
+    ax1.grid('on', which='major', axis='y' )
+    ax1.grid('on', which='major', axis='x' )
+   
+    ax1 = fig.add_subplot(221)
+    ax1.plot(data_clients_plot.loc[data_clients_plot.Region =='East']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='East']['Prepaid FDDS %'] ,marker='o',color='g' )
+    ax1.grid('on', which='major', axis='y' )
+    ax1.grid('on', which='major', axis='x' )
+   
+#     ax1.clear()
+    ax2 = fig.add_subplot(222)
+    ax2.plot(data_clients_plot.loc[data_clients_plot.Region =='West']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='West']['COD FDDS %'] ,marker='o',color='r' )
+    ax2.grid('on', which='major', axis='y' )
+    ax2.grid('on', which='major', axis='x' )
+    ax2 = fig.add_subplot(222)
+    ax2.plot(data_clients_plot.loc[data_clients_plot.Region =='West']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='West']['Overall FDDS %'] ,marker='o',color='b' )
+    ax2.grid('on', which='major', axis='y' )
+    ax2.grid('on', which='major', axis='x' )
+   
+    ax2 = fig.add_subplot(222)
+    ax2.plot(data_clients_plot.loc[data_clients_plot.Region =='West']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='West']['Prepaid FDDS %'] ,marker='o',color='g' )
+    ax2.grid('on', which='major', axis='y' )
+    ax2.grid('on', which='major', axis='x' )
+   
+#     ax2.clear()
+    ax3 = fig.add_subplot(223)
+    ax3.plot(data_clients_plot.loc[data_clients_plot.Region =='North']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='North']['COD FDDS %'] ,marker='o',color='r' )
+    ax3.grid('on', which='major', axis='y' )
+    ax3.grid('on', which='major', axis='x' )
+   
+    ax3 = fig.add_subplot(223)
+    ax3.plot(data_clients_plot.loc[data_clients_plot.Region =='North']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='North']['Overall FDDS %'] ,marker='o',color='b' )
+    ax3.grid('on', which='major', axis='y' )
+    ax3.grid('on', which='major', axis='x' )
+    ax3 = fig.add_subplot(223)
+    ax3.plot(data_clients_plot.loc[data_clients_plot.Region =='North']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='North']['Prepaid FDDS %'] ,marker='o',color='g' )
+    ax3.grid('on', which='major', axis='y' )
+    ax3.grid('on', which='major', axis='x' )
+   
+#     ax3.clear()
+    ax4 = fig.add_subplot(224)
+    ax4.plot(data_clients_plot.loc[data_clients_plot.Region =='South']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='South']['COD FDDS %'] ,marker='o',color='r' )
+    ax3.grid('on', which='major', axis='y' )
+    ax3.grid('on', which='major', axis='x' )
+   
+    ax4 = fig.add_subplot(224)
+    ax4.plot(data_clients_plot.loc[data_clients_plot.Region =='South']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='South']['Overall FDDS %'] ,marker='o',color='b' )
+    ax4.grid('on', which='major', axis='y' )
+    ax4.grid('on', which='major', axis='x' )
+   
+    ax4 = fig.add_subplot(224)
+    ax4.plot(data_clients_plot.loc[data_clients_plot.Region =='South']['Attempt date'],data_clients_plot.loc[data_clients_plot.Region =='South']['Prepaid FDDS %'] ,marker='o',color='g' )
+    ax4.grid('on', which='major', axis='y' )
+    ax4.grid('on', which='major', axis='x' )
+#     ax4.clear()
+    ax1.title.set_text(i + ' East')
+    ax2.title.set_text(i + ' West')
+    ax3.title.set_text(i + ' North')
+    ax4.title.set_text(i + ' South')
+   
+#     fig = matplotlib.pyplot.gcf()
+    fig.set_size_inches(18.5, 10.5)
+   
+    fig.savefig(i+'.png')
+    fig.show()
+#     plt.clf()
